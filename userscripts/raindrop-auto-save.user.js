@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Raindrop.io Auto-Save Tab URL
 // @namespace    https://raindrop.io/
-// @version      1.2.0
+// @version      1.2.1
 // @description  Automatically saves loaded, background, and SPA-navigated tab URLs to Raindrop.io using the extension's save pipeline.
 // @author       Raindrop.io Community
 // @match        http://*/*
@@ -20,6 +20,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // ==/UserScript==
 
@@ -49,10 +50,16 @@
         debug: 'raindrop_debug'
     };
 
+    const CACHE_STORAGE_KEYS = {
+        userCollection: 'raindrop_cached_user_collection'
+    };
+
     const DEFAULT_SPA_DELAY_MS = 1500;
     const DEFAULT_OVERLAY_TIMEOUT_MS = 8000;
     const INITIAL_LOAD_SETTLE_MS = 150;
     const URL_WATCH_INTERVAL_MS = 1000;
+    const MUTATION_COOLDOWN_MS = 150;
+    const USER_COLLECTION_CACHE_TTL_MS = 10 * 60 * 1000;
     const SCREENSHOT_MAX_OUTPUT_WIDTH = 1280;
     const SCREENSHOT_JPEG_QUALITY = 0.88;
     const CAPTURE_READY_TIMEOUT_MS = 8000;
@@ -61,6 +68,11 @@
     const POSTER_FETCH_TIMEOUT_MS = 5000;
     const MAX_CAPTURE_ELEMENTS = 6000;
     const MIN_VISUAL_CONTENT_PIXELS = 24;
+    const MAX_ATTEMPTED_URLS = 1000;
+    const MAX_CACHED_BOOKMARKS = 150;
+    const MAX_SCRAPED_META = 100;
+    const MAX_DELETED_IDS = 500;
+    const MAX_COMPILED_PATTERNS = 256;
 
     const DEFAULT_EXCLUDE_PATTERNS = [
         '*://accounts.google.com/*',
@@ -141,13 +153,140 @@
     };
 
     // -------------------------------------------------------------------------
-    // Storage Helpers
+    // Bounded LRU Collections
     // -------------------------------------------------------------------------
+    class BoundedSet extends Set {
+        constructor(maxSize = 500, iterable) {
+            super();
+            this._maxSize = Math.max(1, maxSize);
+            if (iterable) {
+                for (const item of iterable) this.add(item);
+            }
+        }
+        add(value) {
+            if (super.has(value)) {
+                super.delete(value);
+            } else if (this.size >= this._maxSize) {
+                const oldest = this.values().next().value;
+                super.delete(oldest);
+            }
+            return super.add(value);
+        }
+    }
+
+    class BoundedMap extends Map {
+        constructor(maxSize = 150, onEvict = null) {
+            super();
+            this._maxSize = Math.max(1, maxSize);
+            this._onEvict = typeof onEvict === 'function' ? onEvict : null;
+        }
+        touch(key) {
+            if (!super.has(key)) return undefined;
+            const value = super.get(key);
+            super.delete(key);
+            super.set(key, value);
+            return value;
+        }
+        set(key, value) {
+            if (super.has(key)) {
+                super.delete(key);
+            }
+            super.set(key, value);
+            while (this.size > this._maxSize) {
+                const oldestKey = this.keys().next().value;
+                const oldestVal = super.get(oldestKey);
+                super.delete(oldestKey);
+                if (this._onEvict) {
+                    this._onEvict(oldestKey, oldestVal);
+                }
+            }
+            return this;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Storage Helpers & Settings Cache
+    // -------------------------------------------------------------------------
+    const HAS_VALUE_CHANGE_LISTENER = typeof GM_addValueChangeListener === 'function';
+    const CACHEABLE_STORAGE_KEY_SET = new Set(Object.values(STORAGE_KEYS));
+    const rawSettingsCache = new Map();
+    const parsedSettingsCache = {
+        excludes: null,
+        excludesMatchers: null,
+        excludesSig: '',
+        blockedThumbnails: null,
+        blockedMatchers: null,
+        blockedSig: ''
+    };
+    let storageListenersRegistered = false;
+
+    function invalidateParsedPatternCache(key) {
+        if (!key || key === STORAGE_KEYS.excludes) {
+            parsedSettingsCache.excludes = null;
+            parsedSettingsCache.excludesMatchers = null;
+            parsedSettingsCache.excludesSig = '';
+        }
+        if (!key || key === STORAGE_KEYS.blockedThumbnails) {
+            parsedSettingsCache.blockedThumbnails = null;
+            parsedSettingsCache.blockedMatchers = null;
+            parsedSettingsCache.blockedSig = '';
+        }
+    }
+
+    function handleStorageValueUpdate(key, newValue, fromRemote = false) {
+        if (CACHEABLE_STORAGE_KEY_SET.has(key)) {
+            if (newValue === undefined) {
+                rawSettingsCache.delete(key);
+            } else {
+                rawSettingsCache.set(key, newValue);
+            }
+        }
+        invalidateParsedPatternCache(key);
+
+        if (key === STORAGE_KEYS.token || key === STORAGE_KEYS.collectionId) {
+            if (typeof invalidateCollectionCache === 'function') {
+                invalidateCollectionCache({ skipPersistentClear: fromRemote });
+            }
+        }
+        if (fromRemote && key === STORAGE_KEYS.enabled) {
+            if (typeof handleExternalEnabledChange === 'function') {
+                handleExternalEnabledChange(Boolean(newValue !== undefined ? newValue : true));
+            }
+        }
+    }
+
+    function registerStorageChangeListeners() {
+        if (storageListenersRegistered || !HAS_VALUE_CHANGE_LISTENER) return;
+        storageListenersRegistered = true;
+        for (const key of CACHEABLE_STORAGE_KEY_SET) {
+            try {
+                GM_addValueChangeListener(key, (_name, _oldVal, newVal, remote) => {
+                    handleStorageValueUpdate(key, newVal, Boolean(remote));
+                });
+            } catch (e) {}
+        }
+    }
+
+    function refreshSettingsCache() {
+        if (HAS_VALUE_CHANGE_LISTENER) return;
+        rawSettingsCache.clear();
+        invalidateParsedPatternCache();
+    }
+
     function gmGet(key, fallback) {
+        const canCache = HAS_VALUE_CHANGE_LISTENER && CACHEABLE_STORAGE_KEY_SET.has(key);
+        if (canCache && rawSettingsCache.has(key)) {
+            const cached = rawSettingsCache.get(key);
+            return cached === undefined ? fallback : cached;
+        }
         try {
             if (typeof GM_getValue === 'function') {
                 const value = GM_getValue(key, fallback);
-                return value === undefined ? fallback : value;
+                const resolved = value === undefined ? fallback : value;
+                if (canCache) {
+                    rawSettingsCache.set(key, resolved);
+                }
+                return resolved;
             }
         } catch (e) {
             logWarn('GM_getValue failed', { key, error: e });
@@ -163,6 +302,7 @@
         } catch (e) {
             logWarn('GM_setValue failed', { key, error: e });
         }
+        handleStorageValueUpdate(key, value, false);
     }
 
     function isEnabled() {
@@ -176,6 +316,16 @@
     function getToken() {
         const raw = gmGet(STORAGE_KEYS.token, '');
         return typeof raw === 'string' ? raw.trim() : '';
+    }
+
+    function getTokenAuthFingerprint(token = getToken()) {
+        if (!token) return 'cookie';
+        let hash = 2166136261;
+        for (let i = 0; i < token.length; i++) {
+            hash ^= token.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+        return `t:${token.length}:${(hash >>> 0).toString(36)}`;
     }
 
     function getConfiguredCollectionId() {
@@ -201,16 +351,22 @@
         const rawList = Array.isArray(source)
             ? source
             : String(source || '').split(/\r?\n/);
-        const cleaned = rawList.map((s) => String(s || '').trim()).filter(Boolean);
-        if (!deduplicate) return cleaned;
-        const seen = new Set();
-        const out = [];
-        for (const item of cleaned) {
-            if (seen.has(item)) continue;
-            seen.add(item);
-            out.push(item);
+        const cleaned = [];
+        if (!deduplicate) {
+            for (let i = 0; i < rawList.length; i++) {
+                const s = String(rawList[i] || '').trim();
+                if (s) cleaned.push(s);
+            }
+            return cleaned;
         }
-        return out;
+        const seen = new Set();
+        for (let i = 0; i < rawList.length; i++) {
+            const item = String(rawList[i] || '').trim();
+            if (!item || seen.has(item)) continue;
+            seen.add(item);
+            cleaned.push(item);
+        }
+        return cleaned;
     }
 
     function readStoredPatternList(key) {
@@ -229,26 +385,46 @@
         return { found: false, value: null };
     }
 
-    function getExcludes() {
-        const stored = readStoredPatternList(STORAGE_KEYS.excludes);
-        if (stored.found) {
-            return normalizePatternList(stored.value);
+    function getExcludesInternal() {
+        if (HAS_VALUE_CHANGE_LISTENER && parsedSettingsCache.excludes) {
+            return parsedSettingsCache.excludes;
         }
-        return [...DEFAULT_EXCLUDE_PATTERNS];
+        const stored = readStoredPatternList(STORAGE_KEYS.excludes);
+        const list = stored.found ? normalizePatternList(stored.value) : [...DEFAULT_EXCLUDE_PATTERNS];
+        if (HAS_VALUE_CHANGE_LISTENER) {
+            parsedSettingsCache.excludes = list;
+        }
+        return list;
+    }
+
+    function getExcludes() {
+        const list = getExcludesInternal();
+        return HAS_VALUE_CHANGE_LISTENER ? list.slice() : list;
+    }
+
+    function getBlockedThumbnailsInternal() {
+        if (HAS_VALUE_CHANGE_LISTENER && parsedSettingsCache.blockedThumbnails) {
+            return parsedSettingsCache.blockedThumbnails;
+        }
+        const stored = readStoredPatternList(STORAGE_KEYS.blockedThumbnails);
+        const list = stored.found
+            ? normalizePatternList(stored.value, { deduplicate: true })
+            : [...DEFAULT_BLOCKED_THUMBNAILS];
+        if (HAS_VALUE_CHANGE_LISTENER) {
+            parsedSettingsCache.blockedThumbnails = list;
+        }
+        return list;
     }
 
     function getBlockedThumbnails() {
-        const stored = readStoredPatternList(STORAGE_KEYS.blockedThumbnails);
-        if (stored.found) {
-            return normalizePatternList(stored.value, { deduplicate: true });
-        }
-        return [...DEFAULT_BLOCKED_THUMBNAILS];
+        const list = getBlockedThumbnailsInternal();
+        return HAS_VALUE_CHANGE_LISTENER ? list.slice() : list;
     }
 
     function addBlockedThumbnailPattern(pattern) {
         const clean = String(pattern || '').trim();
         if (!clean || clean === '<screenshot>') return false;
-        const existing = getBlockedThumbnails();
+        const existing = getBlockedThumbnailsInternal();
         if (existing.includes(clean)) return false;
         gmSet(STORAGE_KEYS.blockedThumbnails, [...existing, clean]);
         return true;
@@ -269,47 +445,51 @@
     // -------------------------------------------------------------------------
     const LOG_PREFIX = '[Raindrop Auto-Save]';
 
-    function sanitizeLogText(text) {
-        let out = String(text || '').replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
+    function sanitizeLogText(text, tokenOverride) {
+        if (text === null || text === undefined) return '';
+        let out = String(text);
+        if (!out) return '';
+        if (/Bearer\s+/i.test(out)) {
+            out = out.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
+        }
         try {
-            if (typeof GM_getValue === 'function') {
-                const rawToken = GM_getValue(STORAGE_KEYS.token, '');
-                const token = typeof rawToken === 'string' ? rawToken.trim() : '';
-                if (token && token.length >= 6) {
-                    out = out.split(token).join('[REDACTED]');
-                }
+            const token = tokenOverride !== undefined ? tokenOverride : getToken();
+            if (token && token.length >= 6 && out.includes(token)) {
+                out = out.split(token).join('[REDACTED]');
             }
         } catch (e) {}
         return out;
     }
 
-    function sanitizeHeaders(headers) {
+    function sanitizeHeaders(headers, tokenOverride) {
         if (!headers || typeof headers !== 'object') return undefined;
+        const token = tokenOverride !== undefined ? tokenOverride : getToken();
         const clean = {};
         for (const [k, v] of Object.entries(headers)) {
             if (String(k).toLowerCase() === 'authorization') {
                 clean[k] = String(v).toLowerCase().startsWith('bearer ') ? 'Bearer [REDACTED]' : '[REDACTED]';
             } else {
-                clean[k] = sanitizeLogText(v);
+                clean[k] = sanitizeLogText(v, token);
             }
         }
         return clean;
     }
 
-    function formatLogDetails(details) {
+    function formatLogDetails(details, tokenOverride) {
         if (!details || typeof details !== 'object') return undefined;
+        const token = tokenOverride !== undefined ? tokenOverride : getToken();
         const payload = {};
-        if (details.url !== undefined) payload.url = sanitizeLogText(details.url);
+        if (details.url !== undefined) payload.url = sanitizeLogText(details.url, token);
         if (details.method !== undefined) payload.method = String(details.method);
         if (details.status !== undefined) payload.status = details.status;
         if (details.attempt !== undefined) payload.attempt = details.attempt;
-        if (details.headers !== undefined) payload.headers = sanitizeHeaders(details.headers);
+        if (details.headers !== undefined) payload.headers = sanitizeHeaders(details.headers, token);
 
         for (const [k, v] of Object.entries(details)) {
             if (k === 'error' || k === 'url' || k === 'method' || k === 'status' || k === 'attempt' || k === 'headers') {
                 continue;
             }
-            payload[k] = typeof v === 'string' ? sanitizeLogText(v) : v;
+            payload[k] = typeof v === 'string' ? sanitizeLogText(v, token) : v;
         }
 
         const err = details.error;
@@ -320,9 +500,9 @@
             if (err.code !== undefined || err.error !== undefined) {
                 payload.code = err.code !== undefined ? err.code : err.error;
             }
-            payload.message = sanitizeLogText(err.errorMessage || err.message || String(err));
+            payload.message = sanitizeLogText(err.errorMessage || err.message || String(err), token);
             if (err.stack) {
-                payload.stack = sanitizeLogText(err.stack);
+                payload.stack = sanitizeLogText(err.stack, token);
             }
         }
 
@@ -332,9 +512,10 @@
     function logError(message, details) {
         try {
             if (typeof console === 'undefined' || typeof console.error !== 'function') return;
-            const payload = formatLogDetails(details);
-            if (payload) console.error(LOG_PREFIX, sanitizeLogText(message), payload);
-            else console.error(LOG_PREFIX, sanitizeLogText(message));
+            const token = getToken();
+            const payload = formatLogDetails(details, token);
+            if (payload) console.error(LOG_PREFIX, sanitizeLogText(message, token), payload);
+            else console.error(LOG_PREFIX, sanitizeLogText(message, token));
         } catch (e) {}
     }
 
@@ -343,9 +524,10 @@
             if (typeof console === 'undefined') return;
             const fn = typeof console.warn === 'function' ? console.warn : console.log;
             if (typeof fn !== 'function') return;
-            const payload = formatLogDetails(details);
-            if (payload) fn.call(console, LOG_PREFIX, sanitizeLogText(message), payload);
-            else fn.call(console, LOG_PREFIX, sanitizeLogText(message));
+            const token = getToken();
+            const payload = formatLogDetails(details, token);
+            if (payload) fn.call(console, LOG_PREFIX, sanitizeLogText(message, token), payload);
+            else fn.call(console, LOG_PREFIX, sanitizeLogText(message, token));
         } catch (e) {}
     }
 
@@ -355,9 +537,10 @@
             if (typeof console === 'undefined') return;
             const fn = typeof console.debug === 'function' ? console.debug : console.log;
             if (typeof fn !== 'function') return;
-            const payload = formatLogDetails(details);
-            if (payload) fn.call(console, `${LOG_PREFIX}[debug]`, sanitizeLogText(message), payload);
-            else fn.call(console, `${LOG_PREFIX}[debug]`, sanitizeLogText(message));
+            const token = getToken();
+            const payload = formatLogDetails(details, token);
+            if (payload) fn.call(console, `${LOG_PREFIX}[debug]`, sanitizeLogText(message, token), payload);
+            else fn.call(console, `${LOG_PREFIX}[debug]`, sanitizeLogText(message, token));
         } catch (e) {}
     }
 
@@ -394,11 +577,19 @@
         return '';
     }
 
+    const compiledPatternCache = new BoundedMap(MAX_COMPILED_PATTERNS);
+
     function compileUrlPatternMatcher(pattern, kindLabel = 'exclusion') {
         const raw = String(pattern || '').trim();
         if (!raw) return null;
 
+        const cacheKey = `${kindLabel}\0${raw}`;
+        if (compiledPatternCache.has(cacheKey)) {
+            return compiledPatternCache.get(cacheKey);
+        }
+
         const matchesRdlRenderTarget = /^(?:https?:|\*:)\/\/(?:rdl\.ink|stella\.raindrop\.io)\/render\//i.test(raw);
+        let matcher = null;
 
         if (raw.startsWith('/')) {
             const lastSlash = raw.lastIndexOf('/');
@@ -407,11 +598,16 @@
                 const flags = raw.slice(lastSlash + 1);
                 try {
                     const re = new RegExp(body, flags);
-                    const matcher = (url) => {
-                        if (re.global || re.sticky) re.lastIndex = 0;
-                        return re.test(url);
-                    };
+                    if (re.global || re.sticky) {
+                        matcher = (url) => {
+                            re.lastIndex = 0;
+                            return re.test(url);
+                        };
+                    } else {
+                        matcher = (url) => re.test(url);
+                    }
                     matcher.matchesRdlRenderTarget = false;
+                    compiledPatternCache.set(cacheKey, matcher);
                     return matcher;
                 } catch (e) {
                     logWarn(`Invalid ${kindLabel} regex pattern`, { pattern: raw, error: e });
@@ -421,7 +617,8 @@
         }
 
         if (raw.includes('*') || raw.includes('?')) {
-            const parts = raw.split(/(\*|\?)/);
+            const collapsed = raw.replace(/\*{2,}/g, '*');
+            const parts = collapsed.split(/(\*|\?)/);
             const rawRegexStr = '^' + parts
                 .map((part) => (part === '*' ? '.*' : part === '?' ? '.' : escapeRegExp(part)))
                 .join('') + '$';
@@ -430,12 +627,28 @@
                 .join('') + '$';
             try {
                 const rawRe = new RegExp(rawRegexStr, 'i');
-                const decodedRe = new RegExp(decodedRegexStr, 'i');
-                const matcher = (url) => {
-                    const target = String(url || '');
-                    return rawRe.test(target) || decodedRe.test(safeDecodeUri(target));
-                };
+                if (decodedRegexStr === rawRegexStr) {
+                    matcher = (url, preDecoded) => {
+                        const target = String(url || '');
+                        if (rawRe.test(target)) return true;
+                        if (preDecoded !== undefined) {
+                            return preDecoded !== target && rawRe.test(preDecoded);
+                        }
+                        if (!target.includes('%')) return false;
+                        const decoded = safeDecodeUri(target);
+                        return decoded !== target && rawRe.test(decoded);
+                    };
+                } else {
+                    const decodedRe = new RegExp(decodedRegexStr, 'i');
+                    matcher = (url, preDecoded) => {
+                        const target = String(url || '');
+                        if (rawRe.test(target)) return true;
+                        const decoded = preDecoded !== undefined ? preDecoded : safeDecodeUri(target);
+                        return decodedRe.test(decoded);
+                    };
+                }
                 matcher.matchesRdlRenderTarget = matchesRdlRenderTarget;
+                compiledPatternCache.set(cacheKey, matcher);
                 return matcher;
             } catch (e) {
                 logWarn(`Invalid ${kindLabel} wildcard pattern`, { pattern: raw, error: e });
@@ -445,12 +658,30 @@
 
         const rawNeedle = raw.toLowerCase();
         const decodedNeedle = safeDecodeUri(raw).toLowerCase();
-        const matcher = (url) => {
-            const target = String(url || '');
-            return target.toLowerCase().includes(rawNeedle)
-                || safeDecodeUri(target).toLowerCase().includes(decodedNeedle);
-        };
+        if (decodedNeedle === rawNeedle) {
+            matcher = (url, preDecoded, preLower, preLowerDecoded) => {
+                const lower = preLower !== undefined ? preLower : String(url || '').toLowerCase();
+                if (lower.includes(rawNeedle)) return true;
+                if (preLowerDecoded !== undefined) {
+                    return preLowerDecoded !== lower && preLowerDecoded.includes(rawNeedle);
+                }
+                const target = String(url || '');
+                if (!target.includes('%')) return false;
+                const decoded = preDecoded !== undefined ? preDecoded : safeDecodeUri(target);
+                return decoded !== target && decoded.toLowerCase().includes(rawNeedle);
+            };
+        } else {
+            matcher = (url, preDecoded, preLower, preLowerDecoded) => {
+                const lower = preLower !== undefined ? preLower : String(url || '').toLowerCase();
+                if (lower.includes(rawNeedle)) return true;
+                const lowerDecoded = preLowerDecoded !== undefined
+                    ? preLowerDecoded
+                    : (preDecoded !== undefined ? preDecoded : safeDecodeUri(url)).toLowerCase();
+                return lowerDecoded.includes(decodedNeedle);
+            };
+        }
         matcher.matchesRdlRenderTarget = matchesRdlRenderTarget;
+        compiledPatternCache.set(cacheKey, matcher);
         return matcher;
     }
 
@@ -458,13 +689,44 @@
         return compileUrlPatternMatcher(pattern, 'exclusion');
     }
 
-    function getBlockedThumbnailMatchers(patterns = getBlockedThumbnails()) {
+    function getExcludeMatchers(patterns = getExcludesInternal()) {
+        if (HAS_VALUE_CHANGE_LISTENER && parsedSettingsCache.excludesMatchers && patterns === parsedSettingsCache.excludes) {
+            return parsedSettingsCache.excludesMatchers;
+        }
+        const sig = patterns.join('\0');
+        if (parsedSettingsCache.excludesMatchers && sig === parsedSettingsCache.excludesSig) {
+            return parsedSettingsCache.excludesMatchers;
+        }
         const matchers = [];
-        for (const pattern of patterns) {
-            const matcher = compileUrlPatternMatcher(pattern, 'blocked thumbnail');
+        for (let i = 0; i < patterns.length; i++) {
+            const matcher = compileExcludeMatcher(patterns[i]);
             if (matcher) matchers.push(matcher);
         }
+        parsedSettingsCache.excludesMatchers = matchers;
+        parsedSettingsCache.excludesSig = sig;
         return matchers;
+    }
+
+    function getBlockedThumbnailMatchers(patterns = getBlockedThumbnailsInternal()) {
+        if (HAS_VALUE_CHANGE_LISTENER && parsedSettingsCache.blockedMatchers && patterns === parsedSettingsCache.blockedThumbnails) {
+            return parsedSettingsCache.blockedMatchers;
+        }
+        const sig = patterns.join('\0');
+        if (parsedSettingsCache.blockedMatchers && sig === parsedSettingsCache.blockedSig) {
+            return parsedSettingsCache.blockedMatchers;
+        }
+        const matchers = [];
+        for (let i = 0; i < patterns.length; i++) {
+            const matcher = compileUrlPatternMatcher(patterns[i], 'blocked thumbnail');
+            if (matcher) matchers.push(matcher);
+        }
+        parsedSettingsCache.blockedMatchers = matchers;
+        parsedSettingsCache.blockedSig = sig;
+        return matchers;
+    }
+
+    function matchPrecomputedUrl(matcher, raw, decoded, lower, lowerDecoded) {
+        return matcher(raw, decoded, lower, lowerDecoded);
     }
 
     function isThumbnailBlocked(url, matchers) {
@@ -474,11 +736,37 @@
         const compiled = Array.isArray(matchers) ? matchers : getBlockedThumbnailMatchers();
         if (!compiled.length) return false;
 
+        const hasRdlHost = raw.includes('rdl.ink/render/') || raw.includes('stella.raindrop.io/render/');
+        const startsDoubleSlash = raw.startsWith('//');
+
+        if (!startsDoubleSlash && !hasRdlHost) {
+            const lower = raw.toLowerCase();
+            const decoded = raw.includes('%') ? safeDecodeUri(raw) : raw;
+            const lowerDecoded = decoded === raw ? lower : decoded.toLowerCase();
+            let rdlWrapped = null;
+
+            for (let i = 0; i < compiled.length; i++) {
+                const matcher = compiled[i];
+                if (matchPrecomputedUrl(matcher, raw, decoded, lower, lowerDecoded)) {
+                    return true;
+                }
+                if (matcher.matchesRdlRenderTarget) {
+                    if (rdlWrapped === null) {
+                        rdlWrapped = getThumbUri(raw) || '';
+                    }
+                    if (rdlWrapped && matcher(rdlWrapped)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         const variants = [raw];
-        if (raw.startsWith('//')) {
+        if (startsDoubleSlash) {
             variants.push(`https:${raw}`, `http:${raw}`);
         }
-        const inner = extractRdlInnerUrl(raw);
+        const inner = hasRdlHost ? extractRdlInnerUrl(raw) : '';
         if (inner) {
             variants.push(inner);
             if (inner.startsWith('//')) {
@@ -486,10 +774,25 @@
             }
         }
 
+        const decodedVariants = new Array(variants.length);
+        const lowerVariants = new Array(variants.length);
+        const lowerDecodedVariants = new Array(variants.length);
+        for (let v = 0; v < variants.length; v++) {
+            const cand = variants[v];
+            const dec = cand.includes('%') ? safeDecodeUri(cand) : cand;
+            const low = cand.toLowerCase();
+            decodedVariants[v] = dec;
+            lowerVariants[v] = low;
+            lowerDecodedVariants[v] = dec === cand ? low : dec.toLowerCase();
+        }
+
         let rdlWrapped = null;
-        return compiled.some((matcher) => {
-            if (variants.some((candidate) => matcher(candidate))) {
-                return true;
+        for (let i = 0; i < compiled.length; i++) {
+            const matcher = compiled[i];
+            for (let v = 0; v < variants.length; v++) {
+                if (matchPrecomputedUrl(matcher, variants[v], decodedVariants[v], lowerVariants[v], lowerDecodedVariants[v])) {
+                    return true;
+                }
             }
             if (matcher.matchesRdlRenderTarget) {
                 if (rdlWrapped === null) {
@@ -499,8 +802,8 @@
                     return true;
                 }
             }
-            return false;
-        });
+        }
+        return false;
     }
 
     function isBuiltInExcludedHost(hostname) {
@@ -508,6 +811,29 @@
         if (!host) return true;
         if (host === 'raindrop.io' || host.endsWith('.raindrop.io')) return true;
         if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]' || host === '0.0.0.0') {
+            return true;
+        }
+        return false;
+    }
+
+    function isPermanentlyIneligibleContext() {
+        try {
+            if (typeof window !== 'undefined' && window.top !== window.self) {
+                return true;
+            }
+        } catch (e) {
+            return true;
+        }
+        if (typeof location === 'undefined' || !location.href) return false;
+        try {
+            const parsed = new URL(String(location.href));
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                return true;
+            }
+            if (isBuiltInExcludedHost(parsed.hostname)) {
+                return true;
+            }
+        } catch (e) {
             return true;
         }
         return false;
@@ -550,10 +876,16 @@
             return false;
         }
 
-        const patterns = getExcludes();
-        for (const pattern of patterns) {
-            const matcher = compileExcludeMatcher(pattern);
-            if (matcher && matcher(parsed.href)) {
+        const matchers = getExcludeMatchers();
+        if (!matchers.length) return false;
+
+        const href = parsed.href;
+        const decoded = href.includes('%') ? safeDecodeUri(href) : href;
+        const lower = href.toLowerCase();
+        const lowerDecoded = decoded === href ? lower : decoded.toLowerCase();
+
+        for (let i = 0; i < matchers.length; i++) {
+            if (matchPrecomputedUrl(matchers[i], href, decoded, lower, lowerDecoded)) {
                 return true;
             }
         }
@@ -598,17 +930,17 @@
     function parseApiResponse(res, finalUrl) {
         const status = typeof res.status === 'number' ? res.status : 0;
         const text = typeof res.responseText === 'string' ? res.responseText : '';
-        const headers = String(res.responseHeaders || '').toLowerCase();
 
         let json = null;
         if (text) {
             try {
                 json = JSON.parse(text);
             } catch (e) {
-                if (status >= 200 && status < 300 && headers.includes('text/plain')) {
-                    return text;
-                }
                 if (status >= 200 && status < 300) {
+                    const headers = String(res.responseHeaders || '').toLowerCase();
+                    if (headers.includes('text/plain')) {
+                        return text;
+                    }
                     throw new ApiError({
                         status,
                         errorMessage: `${e.message} ${finalUrl}`
@@ -665,7 +997,7 @@
                 return;
             }
 
-            const token = getToken();
+            const token = options.token !== undefined ? options.token : getToken();
             const headers = {
                 Accept: 'application/json',
                 ...(options.headers || {})
@@ -731,17 +1063,22 @@
         const retries = typeof options.retries === 'number'
             ? options.retries
             : (upperMethod === 'GET' ? API_RETRIES : 0);
+        const debugEnabled = isDebugEnabled();
+        const requestToken = getToken();
+        const reqOpts = { ...options, token: requestToken };
 
         let lastError;
         for (let i = 0; i <= retries; i++) {
             try {
-                logDebug('API request', {
-                    method: upperMethod,
-                    url: finalUrl,
-                    attempt: i + 1,
-                    authMode: getToken() ? 'bearer' : 'cookie'
-                });
-                return await gmRequestOnce(upperMethod, finalUrl, data, options);
+                if (debugEnabled) {
+                    logDebug('API request', {
+                        method: upperMethod,
+                        url: finalUrl,
+                        attempt: i + 1,
+                        authMode: requestToken ? 'bearer' : 'cookie'
+                    });
+                }
+                return await gmRequestOnce(upperMethod, finalUrl, data, reqOpts);
             } catch (err) {
                 lastError = err instanceof ApiError
                     ? err
@@ -783,7 +1120,7 @@
         logError('API request failed', {
             method: upperMethod,
             url: finalUrl,
-            headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : undefined,
+            headers: requestToken ? { Authorization: `Bearer ${requestToken}` } : undefined,
             error: finalError
         });
 
@@ -833,20 +1170,72 @@
         }
     }
 
+    const META_KEYS_OF_INTEREST = new Set([
+        'twitter:url', 'og:url',
+        'twitter:title', 'og:title', 'title',
+        'twitter:description', 'og:description', 'description',
+        'twitter:image', 'twitter:image:src', 'og:image', 'og:image:src'
+    ]);
+
+    function collectPageMetaMap() {
+        const latestByKey = new Map();
+        if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') {
+            return latestByKey;
+        }
+        const nodes = document.querySelectorAll('meta[name], meta[property]');
+        for (let i = 0; i < nodes.length; i++) {
+            const elem = nodes[i];
+            const nameAttr = (elem.getAttribute && elem.getAttribute('name')) || elem.name || '';
+            const propAttr = (elem.getAttribute && elem.getAttribute('property')) || elem.property || '';
+            const hasName = nameAttr && META_KEYS_OF_INTEREST.has(nameAttr);
+            const hasProp = propAttr && propAttr !== nameAttr && META_KEYS_OF_INTEREST.has(propAttr);
+            if (!hasName && !hasProp) continue;
+
+            const content = elem.content !== undefined
+                ? elem.content
+                : (elem.getAttribute && elem.getAttribute('content'));
+            const normalized = content ? String(content).trim().slice(0, 10000) : null;
+
+            if (hasName) {
+                latestByKey.set(nameAttr, { index: i, value: normalized });
+            }
+            if (hasProp) {
+                latestByKey.set(propAttr, { index: i, value: normalized });
+            }
+        }
+        return latestByKey;
+    }
+
+    function pickMetaFromMap(metaMap, ...keys) {
+        let bestIndex = -1;
+        let bestValue = null;
+        for (let i = 0; i < keys.length; i++) {
+            const entry = metaMap.get(keys[i]);
+            if (entry && entry.index >= bestIndex) {
+                bestIndex = entry.index;
+                bestValue = entry.value;
+            }
+        }
+        return bestValue || null;
+    }
+
     function getMeta(...keys) {
         const selector = keys.map((key) => `meta[name="${key}"], meta[property="${key}"]`).join(', ');
-        const nodes = [...document.querySelectorAll(selector)];
-        const elem = nodes.at ? nodes.at(-1) : nodes[nodes.length - 1];
+        const nodes = document.querySelectorAll(selector);
+        const elem = nodes.length ? nodes[nodes.length - 1] : null;
         const content = elem && (elem.content !== undefined ? elem.content : (elem.getAttribute && elem.getAttribute('content')));
         if (!elem || !content) return null;
         return String(content).trim().slice(0, 10000);
     }
 
-    function getJsonLd() {
+    function getJsonLd(isSoftNavOverride) {
         let item = {};
+        const isSoftNav = typeof isSoftNavOverride === 'boolean' ? isSoftNavOverride : softNavigated();
+        const scripts = document.querySelectorAll('script[type="application/ld+json"]');
 
         search:
-        for (const elem of document.querySelectorAll('script[type="application/ld+json"]')) {
+        for (let s = 0; s < scripts.length; s++) {
+            const elem = scripts[s];
             try {
                 const json = JSON.parse(elem.textContent);
 
@@ -856,7 +1245,7 @@
                     if (one['@id'] && canParseURL(one['@id']) && !similarURL(one['@id'])) continue;
 
                     if (one.name || one.headline) {
-                        if (softNavigated() && !one.url && !(one['@id'] && canParseURL(one['@id']))) continue;
+                        if (isSoftNav && !one.url && !(one['@id'] && canParseURL(one['@id']))) continue;
                         item = one;
                     } else if (Array.isArray(one['@graph'])) {
                         item = one['@graph'].find((graph) => graph && similarURL(graph.url)) || {};
@@ -882,15 +1271,26 @@
         const images = [];
 
         try {
-            for (const img of document.querySelectorAll('img')) {
+            const docImages = document.images;
+            const imgList = (docImages && typeof docImages.length === 'number')
+                ? docImages
+                : document.querySelectorAll('img');
+            for (let i = 0; i < imgList.length; i++) {
                 if (images.length >= 9) break;
+                const img = imgList[i];
+                if (!img || !img.complete) continue;
                 const src = img.src || (img.getAttribute && img.getAttribute('src')) || '';
-                if (!img.complete || !src || src.includes('.svg') || src.startsWith('data:image/svg+xml')) continue;
+                if (!src || src.includes('.svg') || src.startsWith('data:image/svg+xml')) continue;
+
+                const natW = img.naturalWidth || 0;
+                const natH = img.naturalHeight || 0;
+                if (natW <= 100 || natH <= 100) continue;
+
                 if (!img.offsetParent) continue;
                 if (typeof img.closest === 'function' && img.closest('header, footer, aside')) continue;
 
-                const width = Math.min(img.naturalWidth || 0, img.width || 0);
-                const height = Math.min(img.naturalHeight || 0, img.height || 0);
+                const width = Math.min(natW, img.width || 0);
+                const height = Math.min(natH, img.height || 0);
 
                 if (width > 100 && height > 100) {
                     let url;
@@ -937,12 +1337,22 @@
         });
     }
 
+    let cachedDomParser = null;
+    let cachedDomParserCtor = null;
+
     function htmlDecode(input) {
         const raw = input || '';
         if (!raw) return '';
+        if (typeof raw === 'string' && !raw.includes('&') && !raw.includes('<')) {
+            return raw;
+        }
         try {
             if (typeof DOMParser !== 'undefined') {
-                const doc = new DOMParser().parseFromString(raw, 'text/html');
+                if (!cachedDomParser || cachedDomParserCtor !== DOMParser) {
+                    cachedDomParser = new DOMParser();
+                    cachedDomParserCtor = DOMParser;
+                }
+                const doc = cachedDomParser.parseFromString(raw, 'text/html');
                 if (doc && doc.documentElement) {
                     return doc.documentElement.textContent;
                 }
@@ -955,28 +1365,29 @@
     }
 
     function getItem() {
-        const trustMeta = !softNavigated()
-            || similarURL(getMeta('twitter:url', 'og:url'))
-            || getMeta('twitter:title', 'og:title') == String(document.title || '').trim();
-        const meta = (...keys) => (trustMeta ? getMeta(...keys) : null);
-        const ld = getJsonLd();
+        const isSoftNav = softNavigated();
+        const metaMap = collectPageMetaMap();
+        const rawDocTitle = String(document.title || '');
+        const trimmedDocTitle = rawDocTitle.trim();
+        const metaTitle = pickMetaFromMap(metaMap, 'twitter:title', 'og:title');
+        const trustMeta = !isSoftNav
+            || similarURL(pickMetaFromMap(metaMap, 'twitter:url', 'og:url'))
+            || metaTitle == trimmedDocTitle;
+        const ld = getJsonLd(isSoftNav);
         const blockedMatchers = getBlockedThumbnailMatchers();
 
-        const rawDocTitle = String(document.title || '');
         const strippedHost = escapeRegExp(String(location.hostname || '').replace('www.', ''));
         const hostPrefixRegex = strippedHost ? new RegExp(`^${strippedHost}.`, 'i') : null;
         const fallbackDocTitle = (hostPrefixRegex ? rawDocTitle.replace(hostPrefixRegex, '') : rawDocTitle).trim();
 
         const item = {
             link: location.href,
-            title: meta('twitter:title', 'og:title')
-                || meta('title')
+            title: (trustMeta ? (metaTitle || pickMetaFromMap(metaMap, 'title')) : null)
                 || htmlDecode(ld.name || ld.headline)
                 || fallbackDocTitle,
-            excerpt: meta('twitter:description', 'og:description')
-                || meta('description')
+            excerpt: (trustMeta ? (pickMetaFromMap(metaMap, 'twitter:description', 'og:description') || pickMetaFromMap(metaMap, 'description')) : null)
                 || htmlDecode(ld.description),
-            cover: meta('twitter:image', 'twitter:image:src', 'og:image', 'og:image:src')
+            cover: (trustMeta ? pickMetaFromMap(metaMap, 'twitter:image', 'twitter:image:src', 'og:image', 'og:image:src') : null)
                 || (ld.image && ld.image.url)
         };
 
@@ -1001,10 +1412,20 @@
             }
         }
 
-        const images = [
-            ...(item.cover ? [item.cover] : []),
-            ...grabImages(blockedMatchers)
-        ].filter((value, index, self) => self.indexOf(value) === index);
+        const pageImages = grabImages(blockedMatchers);
+        const images = [];
+        const seenImages = new Set();
+        if (item.cover) {
+            seenImages.add(item.cover);
+            images.push(item.cover);
+        }
+        for (let i = 0; i < pageImages.length; i++) {
+            const imgUrl = pageImages[i];
+            if (!seenImages.has(imgUrl)) {
+                seenImages.add(imgUrl);
+                images.push(imgUrl);
+            }
+        }
 
         if (images.length) {
             item.media = images.map((link) => ({
@@ -1345,8 +1766,17 @@
         return safeLayers.length ? safeLayers.join(', ') : 'none';
     }
 
-    function safeImageToDataUrl(sourceEl, maxDim = 800) {
+    function releaseCanvas(canvas) {
+        if (!canvas) return;
+        try {
+            canvas.width = 0;
+            canvas.height = 0;
+        } catch (e) {}
+    }
+
+    function safeImageToDataUrl(sourceEl, maxDim = 800, scratchState = null) {
         if (!sourceEl || typeof document === 'undefined') return null;
+        let ownCanvas = null;
         try {
             const tag = String(sourceEl.tagName || '').toUpperCase();
             if (tag === 'CANVAS') {
@@ -1373,17 +1803,40 @@
             const scale = Math.min(1, maxDim / Math.max(srcW, srcH));
             const w = Math.max(1, Math.round(srcW * scale));
             const h = Math.max(1, Math.round(srcH * scale));
-            const canvas = document.createElement('canvas');
-            canvas.width = w;
-            canvas.height = h;
-            const ctx = canvas.getContext && canvas.getContext('2d');
+            let canvas = scratchState && scratchState.canvas;
+            let ctx = scratchState && scratchState.ctx;
+            if (!canvas) {
+                canvas = document.createElement('canvas');
+                ctx = canvas.getContext && canvas.getContext('2d');
+                if (scratchState) {
+                    scratchState.canvas = canvas;
+                    scratchState.ctx = ctx;
+                } else {
+                    ownCanvas = canvas;
+                }
+            }
             if (!ctx) return null;
+            if (canvas.width !== w) canvas.width = w;
+            if (canvas.height !== h) canvas.height = h;
+            if (typeof ctx.clearRect === 'function') {
+                ctx.clearRect(0, 0, w, h);
+            }
             ctx.drawImage(sourceEl, 0, 0, w, h);
             return canvas.toDataURL('image/png');
         } catch (e) {
+            if (scratchState && scratchState.canvas) {
+                releaseCanvas(scratchState.canvas);
+                scratchState.canvas = null;
+                scratchState.ctx = null;
+            }
             return null;
+        } finally {
+            if (ownCanvas) releaseCanvas(ownCanvas);
         }
     }
+
+    let cachedProbeCanvas = null;
+    let cachedProbeCtx = null;
 
     function isSourceDrawableSafe(sourceEl) {
         if (!sourceEl || typeof document === 'undefined') return false;
@@ -1402,17 +1855,27 @@
                 } else {
                     if ((sourceEl.readyState || 0) < 2 || !sourceEl.videoWidth || !sourceEl.videoHeight) return false;
                 }
-                const probe = document.createElement('canvas');
-                probe.width = 1;
-                probe.height = 1;
-                const pctx = probe.getContext && probe.getContext('2d');
-                if (!pctx) return false;
-                pctx.drawImage(sourceEl, 0, 0, 1, 1);
-                pctx.getImageData(0, 0, 1, 1);
+                if (!cachedProbeCanvas || !cachedProbeCtx) {
+                    cachedProbeCanvas = document.createElement('canvas');
+                    cachedProbeCanvas.width = 1;
+                    cachedProbeCanvas.height = 1;
+                    cachedProbeCtx = cachedProbeCanvas.getContext
+                        ? (cachedProbeCanvas.getContext('2d', { willReadFrequently: true }) || cachedProbeCanvas.getContext('2d'))
+                        : null;
+                }
+                if (!cachedProbeCtx) return false;
+                if (typeof cachedProbeCtx.clearRect === 'function') {
+                    cachedProbeCtx.clearRect(0, 0, 1, 1);
+                }
+                cachedProbeCtx.drawImage(sourceEl, 0, 0, 1, 1);
+                cachedProbeCtx.getImageData(0, 0, 1, 1);
                 return true;
             }
             return false;
         } catch (e) {
+            releaseCanvas(cachedProbeCanvas);
+            cachedProbeCanvas = null;
+            cachedProbeCtx = null;
             return false;
         }
     }
@@ -1478,7 +1941,8 @@
         const target = String(headerName || '').toLowerCase();
         if (!headersText || !target) return '';
         const lines = String(headersText).split(/\r?\n/);
-        for (const line of lines) {
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
             const idx = line.indexOf(':');
             if (idx <= 0) continue;
             if (line.slice(0, idx).trim().toLowerCase() === target) {
@@ -1490,15 +1954,19 @@
 
     function drawDrawableToCleanCanvas(drawable, srcW, srcH, maxDim = 800) {
         if (!drawable || !srcW || !srcH || typeof document === 'undefined') return null;
+        let canvas = null;
         try {
             const scale = Math.min(1, maxDim / Math.max(srcW, srcH));
             const w = Math.max(1, Math.round(srcW * scale));
             const h = Math.max(1, Math.round(srcH * scale));
-            const canvas = document.createElement('canvas');
+            canvas = document.createElement('canvas');
             canvas.width = w;
             canvas.height = h;
             const ctx = canvas.getContext && canvas.getContext('2d');
-            if (!ctx) return null;
+            if (!ctx) {
+                releaseCanvas(canvas);
+                return null;
+            }
             ctx.drawImage(drawable, 0, 0, w, h);
             if (typeof ctx.getImageData === 'function') {
                 ctx.getImageData(0, 0, 1, 1);
@@ -1507,10 +1975,12 @@
                 ? canvas.toDataURL('image/png')
                 : '';
             if (dataUrl && !dataUrl.startsWith('data:image/')) {
+                releaseCanvas(canvas);
                 return null;
             }
             return { canvas, dataUrl: dataUrl || null };
         } catch (e) {
+            releaseCanvas(canvas);
             return null;
         }
     }
@@ -1677,7 +2147,7 @@
         return {
             dataUrl: rendered.dataUrl || fallbackDataUrl,
             drawable: rendered.canvas,
-            cleanup: null
+            cleanup: () => releaseCanvas(rendered.canvas)
         };
     }
 
@@ -1694,7 +2164,11 @@
                         if (typeof bitmap.close === 'function') {
                             try { bitmap.close(); } catch (e) {}
                         }
-                        return { dataUrl: rendered.dataUrl, drawable: rendered.canvas, cleanup: null };
+                        return {
+                            dataUrl: rendered.dataUrl,
+                            drawable: rendered.canvas,
+                            cleanup: () => releaseCanvas(rendered.canvas)
+                        };
                     }
                     return {
                         dataUrl: null,
@@ -1794,6 +2268,22 @@
         return null;
     }
 
+    function isNodeAncestryVisible(node, root) {
+        let cur = node;
+        while (cur && cur.nodeType === 1) {
+            const cs = safeGetComputedStyle(cur);
+            if (cs && (cs.display === 'none' || parseFloat(cs.opacity || '1') <= 0)) {
+                return false;
+            }
+            if (cur === node && cs && cs.visibility === 'hidden') {
+                return false;
+            }
+            if (cur === root) break;
+            cur = cur.parentNode || (cur.host ? cur.host : null);
+        }
+        return true;
+    }
+
     function collectVisibleVideoElements(root, viewportBounds) {
         const videos = [];
         if (!root) return videos;
@@ -1810,13 +2300,10 @@
             const tag = String(node.tagName || '').toUpperCase();
             if (SKIP_CAPTURE_TAGS.has(tag) || tag === 'SOURCE') continue;
 
-            const cs = safeGetComputedStyle(node);
-            if (cs && (cs.display === 'none' || parseFloat(cs.opacity || '1') <= 0)) continue;
-
             visited++;
 
             if (tag === 'VIDEO') {
-                if (!cs || cs.visibility !== 'hidden') {
+                if (isNodeAncestryVisible(node, root)) {
                     const box = typeof node.getBoundingClientRect === 'function' ? node.getBoundingClientRect() : null;
                     if (
                         (!box || !viewportBounds || rectsIntersect(box, viewportBounds, 100))
@@ -1830,8 +2317,9 @@
 
             const children = collectChildNodesForCapture(node);
             for (let i = children.length - 1; i >= 0; i--) {
-                if (children[i] && children[i].nodeType === 1) {
-                    stack.push(children[i]);
+                const child = children[i];
+                if (child && child.nodeType === 1) {
+                    stack.push(child);
                 }
             }
         }
@@ -1930,17 +2418,228 @@
         return match[2].replace(/\\(["'\\])/g, '$1');
     }
 
-    function buildComputedCssText(cs, overrides = {}) {
+    const UA_TYPOGRAPHY_TAGS = new Set([
+        'A', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'B', 'STRONG', 'I', 'EM',
+        'CITE', 'DFN', 'VAR', 'CODE', 'KBD', 'SAMP', 'TT', 'PRE', 'SMALL',
+        'BIG', 'SUB', 'SUP', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'LEGEND',
+        'TH', 'TABLE', 'CAPTION', 'CENTER', 'MARK', 'ABBR', 'ADDRESS',
+        'BLOCKQUOTE', 'Q', 'S', 'U', 'DEL', 'INS'
+    ]);
+
+    const UA_SPACING_TAGS = new Set([
+        'BODY', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'P', 'BLOCKQUOTE', 'PRE',
+        'UL', 'OL', 'MENU', 'DIR', 'DL', 'DD', 'FIGURE', 'FIELDSET', 'LEGEND',
+        'INPUT', 'BUTTON', 'SELECT', 'TEXTAREA', 'HR', 'TH', 'TD', 'ADDRESS'
+    ]);
+
+    const UA_BORDER_TAGS = new Set([
+        'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'HR', 'FIELDSET', 'TABLE',
+        'TD', 'TH', 'IFRAME'
+    ]);
+
+    const UA_BG_TAGS = new Set([
+        'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'MARK'
+    ]);
+
+    const UA_BOX_TAGS = new Set([
+        'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'HR', 'TABLE', 'SVG'
+    ]);
+
+    const REPLACED_TAGS = new Set([
+        'IMG', 'VIDEO', 'CANVAS', 'SVG', 'IFRAME', 'OBJECT', 'EMBED',
+        'INPUT', 'TEXTAREA', 'SELECT'
+    ]);
+
+    const TABLE_TAGS = new Set([
+        'TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TD', 'TH', 'COL', 'COLGROUP'
+    ]);
+
+    const VERTICAL_ALIGN_UA_TAGS = new Set([
+        'THEAD', 'TBODY', 'TFOOT', 'TR', 'TH', 'TD', 'SUB', 'SUP', 'TEXTAREA'
+    ]);
+
+    const INHERITED_TEXT_PROPS = new Set([
+        'color', 'font-family', 'font-size', 'font-weight', 'font-style',
+        'line-height', 'letter-spacing', 'text-align', 'text-transform',
+        'white-space', 'word-break', 'overflow-wrap', 'visibility'
+    ]);
+
+    const FLEX_GRID_CONTAINER_PROPS = new Set([
+        'flex-direction', 'flex-wrap', 'justify-content', 'align-items',
+        'align-content', 'row-gap', 'column-gap'
+    ]);
+
+    const FLEX_ITEM_PROPS = new Set([
+        'flex-grow', 'flex-shrink', 'flex-basis', 'align-self'
+    ]);
+
+    const ALWAYS_DEFAULT_SKIP = new Map([
+        ['float', 'none'],
+        ['clear', 'none'],
+        ['z-index', 'auto'],
+        ['opacity', '1'],
+        ['box-shadow', 'none'],
+        ['max-width', 'none'],
+        ['max-height', 'none'],
+        ['grid-template-columns', 'none'],
+        ['grid-template-rows', 'none'],
+        ['grid-column-start', 'auto'],
+        ['grid-column-end', 'auto'],
+        ['grid-row-start', 'auto'],
+        ['grid-row-end', 'auto']
+    ]);
+
+    function buildComputedCssText(cs, overrides = {}, parentCs = null, tagName = '') {
         const parts = [];
         if (cs) {
-            for (const prop of SNAPSHOT_CSS_PROPS) {
-                if (Object.prototype.hasOwnProperty.call(overrides, prop)) continue;
-                let val = cs.getPropertyValue(prop);
-                if (!val) continue;
-                if (prop === 'background-image') {
-                    val = sanitizeCssBackgroundImage(val);
-                    if (!val || val === 'none') continue;
+            const tag = String(tagName || '').toUpperCase();
+            const hasTag = Boolean(tag);
+            const hasOverride = (prop) => Object.prototype.hasOwnProperty.call(overrides, prop);
+
+            const display = hasOverride('display') ? overrides.display : cs.getPropertyValue('display');
+            const position = hasOverride('position') ? overrides.position : cs.getPropertyValue('position');
+            const isStatic = position === 'static';
+            const isFlexOrGrid = display === 'flex' || display === 'inline-flex' || display === 'grid' || display === 'inline-grid';
+            const parentDisplay = parentCs ? parentCs.getPropertyValue('display') : '';
+            const parentIsFlexOrGrid = !parentCs
+                || parentDisplay === 'flex' || parentDisplay === 'inline-flex'
+                || parentDisplay === 'grid' || parentDisplay === 'inline-grid';
+
+            const bgImageRaw = hasOverride('background-image') ? overrides['background-image'] : cs.getPropertyValue('background-image');
+            const sanitizedBgImage = sanitizeCssBackgroundImage(bgImageRaw);
+            const hasBgImage = Boolean(sanitizedBgImage && sanitizedBgImage !== 'none');
+
+            const transformVal = hasOverride('transform') ? overrides.transform : cs.getPropertyValue('transform');
+            const hasTransform = Boolean(transformVal && transformVal !== 'none');
+
+            const bTopStyle = cs.getPropertyValue('border-top-style');
+            const bRightStyle = cs.getPropertyValue('border-right-style');
+            const bBottomStyle = cs.getPropertyValue('border-bottom-style');
+            const bLeftStyle = cs.getPropertyValue('border-left-style');
+
+            const canInheritTypography = Boolean(parentCs && hasTag && !UA_TYPOGRAPHY_TAGS.has(tag));
+            const keepUaSpacing = !hasTag || UA_SPACING_TAGS.has(tag);
+            const keepUaBorder = !hasTag || UA_BORDER_TAGS.has(tag);
+            const keepUaBg = !hasTag || UA_BG_TAGS.has(tag);
+            const keepUaBox = !hasTag || UA_BOX_TAGS.has(tag);
+            const isReplaced = !hasTag || REPLACED_TAGS.has(tag);
+            const isTableLike = !hasTag || TABLE_TAGS.has(tag) || (display && display.includes('table'));
+
+            for (let i = 0; i < SNAPSHOT_CSS_PROPS.length; i++) {
+                const prop = SNAPSHOT_CSS_PROPS[i];
+                if (hasOverride(prop)) continue;
+
+                if (isStatic && (prop === 'top' || prop === 'right' || prop === 'bottom' || prop === 'left')) continue;
+                if (!hasBgImage && (prop === 'background-image' || prop === 'background-position' || prop === 'background-size' || prop === 'background-repeat')) continue;
+                if (!hasTransform && (prop === 'transform' || prop === 'transform-origin')) continue;
+                if (!isFlexOrGrid && FLEX_GRID_CONTAINER_PROPS.has(prop)) continue;
+                if (!parentIsFlexOrGrid && FLEX_ITEM_PROPS.has(prop)) continue;
+                if (!isReplaced && (prop === 'object-fit' || prop === 'object-position')) continue;
+                if (prop === 'list-style-type' && hasTag && display !== 'list-item' && tag !== 'UL' && tag !== 'OL' && tag !== 'LI' && tag !== 'MENU') continue;
+                if (!isTableLike && (prop === 'border-collapse' || prop === 'border-spacing')) continue;
+
+                if (bTopStyle === 'none' || bTopStyle === 'hidden') {
+                    if (prop === 'border-top-width' || prop === 'border-top-color' || (prop === 'border-top-style' && !keepUaBorder)) continue;
                 }
+                if (bRightStyle === 'none' || bRightStyle === 'hidden') {
+                    if (prop === 'border-right-width' || prop === 'border-right-color' || (prop === 'border-right-style' && !keepUaBorder)) continue;
+                }
+                if (bBottomStyle === 'none' || bBottomStyle === 'hidden') {
+                    if (prop === 'border-bottom-width' || prop === 'border-bottom-color' || (prop === 'border-bottom-style' && !keepUaBorder)) continue;
+                }
+                if (bLeftStyle === 'none' || bLeftStyle === 'hidden') {
+                    if (prop === 'border-left-width' || prop === 'border-left-color' || (prop === 'border-left-style' && !keepUaBorder)) continue;
+                }
+
+                let val;
+                if (prop === 'display') val = display;
+                else if (prop === 'position') val = position;
+                else if (prop === 'background-image') val = sanitizedBgImage;
+                else if (prop === 'transform') val = transformVal;
+                else if (prop === 'border-top-style') val = bTopStyle;
+                else if (prop === 'border-right-style') val = bRightStyle;
+                else if (prop === 'border-bottom-style') val = bBottomStyle;
+                else if (prop === 'border-left-style') val = bLeftStyle;
+                else val = cs.getPropertyValue(prop);
+
+                if (!val) continue;
+
+                if (prop === 'background-image') {
+                    parts.push(`${prop}:${val}`);
+                    continue;
+                }
+
+                if (prop === 'background-color') {
+                    if (!keepUaBg && (val === 'rgba(0, 0, 0, 0)' || val === 'transparent')) continue;
+                }
+
+                if (prop === 'position' && !keepUaBox && val === 'static') continue;
+
+                if (ALWAYS_DEFAULT_SKIP.get(prop) === val) continue;
+
+                if (isFlexOrGrid && FLEX_GRID_CONTAINER_PROPS.has(prop)) {
+                    if (
+                        (prop === 'flex-direction' && val === 'row')
+                        || (prop === 'flex-wrap' && val === 'nowrap')
+                        || val === 'normal'
+                    ) {
+                        continue;
+                    }
+                }
+
+                if (parentIsFlexOrGrid && FLEX_ITEM_PROPS.has(prop)) {
+                    if (
+                        (prop === 'flex-grow' && val === '0')
+                        || (prop === 'flex-shrink' && val === '1')
+                        || (prop === 'flex-basis' && val === 'auto')
+                        || (prop === 'align-self' && val === 'auto')
+                    ) {
+                        continue;
+                    }
+                }
+
+                if (prop === 'min-width' || prop === 'min-height') {
+                    if ((!parentIsFlexOrGrid && val === '0px') || (parentIsFlexOrGrid && val === 'auto')) continue;
+                }
+
+                if (prop === 'box-sizing' && !keepUaBox && val === 'content-box') continue;
+                if ((prop === 'overflow-x' || prop === 'overflow-y') && !keepUaBox && val === 'visible') continue;
+
+                if (prop.startsWith('margin-') || prop.startsWith('padding-')) {
+                    if (!keepUaSpacing && val === '0px') continue;
+                }
+
+                if (
+                    !keepUaBox
+                    && val === '0px'
+                    && (
+                        prop === 'border-top-left-radius'
+                        || prop === 'border-top-right-radius'
+                        || prop === 'border-bottom-right-radius'
+                        || prop === 'border-bottom-left-radius'
+                    )
+                ) {
+                    continue;
+                }
+
+                if (prop === 'vertical-align' && hasTag && !VERTICAL_ALIGN_UA_TAGS.has(tag) && val === 'baseline') continue;
+                if (prop === 'text-decoration-line' && hasTag && !UA_TYPOGRAPHY_TAGS.has(tag) && val === 'none') continue;
+
+                if (canInheritTypography && INHERITED_TEXT_PROPS.has(prop)) {
+                    if (val === parentCs.getPropertyValue(prop)) {
+                        if (
+                            prop !== 'line-height'
+                            || val !== 'normal'
+                            || (
+                                cs.getPropertyValue('font-size') === parentCs.getPropertyValue('font-size')
+                                && cs.getPropertyValue('font-family') === parentCs.getPropertyValue('font-family')
+                            )
+                        ) {
+                            continue;
+                        }
+                    }
+                }
+
                 parts.push(`${prop}:${val}`);
             }
         }
@@ -1949,10 +2648,13 @@
                 parts.push(`${prop}:${val}`);
             }
         }
-        return stripInvalidXmlChars(parts.join(';'));
+        const joined = parts.join(';');
+        return /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/.test(joined)
+            ? stripInvalidXmlChars(joined)
+            : joined;
     }
 
-    function createSnapshotPlaceholder(cs, box) {
+    function createSnapshotPlaceholder(cs, box, parentCs = null, tagName = '') {
         const placeholder = document.createElementNS(XHTML_NS, 'div');
         const overrides = {
             display: cs && cs.display === 'inline' ? 'inline-block' : ((cs && cs.display) || 'block')
@@ -1963,36 +2665,37 @@
         if (box && box.height > 0 && (!cs || cs.height === 'auto')) {
             overrides.height = `${box.height}px`;
         }
-        placeholder.setAttribute('style', buildComputedCssText(cs, overrides));
+        placeholder.setAttribute('style', buildComputedCssText(cs, overrides, parentCs, tagName || 'DIV'));
         return placeholder;
     }
 
     function collectChildNodesForCapture(el) {
         if (el.shadowRoot && el.shadowRoot.mode === 'open') {
-            return [...el.shadowRoot.childNodes];
+            return el.shadowRoot.childNodes;
         }
         if (String(el.tagName || '').toUpperCase() === 'SLOT' && typeof el.assignedNodes === 'function') {
             const assigned = el.assignedNodes({ flatten: true });
             if (assigned && assigned.length) return assigned;
         }
-        return [...el.childNodes];
+        return el.childNodes;
     }
 
-    function cloneSvgForSnapshot(svgNode, state, viewportBounds) {
+    function cloneSvgForSnapshot(svgNode, state, viewportBounds, parentCs = null) {
         if (!svgNode || state.count >= MAX_CAPTURE_ELEMENTS) return null;
         const cs = safeGetComputedStyle(svgNode);
         if (cs && (cs.display === 'none' || parseFloat(cs.opacity || '1') <= 0)) return null;
 
         const box = typeof svgNode.getBoundingClientRect === 'function' ? svgNode.getBoundingClientRect() : null;
         if (box && viewportBounds && !rectsIntersect(box, viewportBounds, 40)) {
-            return createSnapshotPlaceholder(cs, box);
+            return createSnapshotPlaceholder(cs, box, parentCs, 'SVG');
         }
 
         state.count++;
         const clone = svgNode.cloneNode(true);
         const queue = [clone];
-        while (queue.length) {
-            const cur = queue.shift();
+        let head = 0;
+        while (head < queue.length) {
+            const cur = queue[head++];
             if (!cur || cur.nodeType !== 1) continue;
             const tag = String(cur.tagName || '').toLowerCase();
             if (tag === 'script' || tag === 'foreignobject') {
@@ -2017,8 +2720,11 @@
                     }
                 }
             }
-            if (cur.children && cur.children.length) {
-                queue.push(...cur.children);
+            const children = cur.children;
+            if (children && children.length) {
+                for (let i = 0; i < children.length; i++) {
+                    queue.push(children[i]);
+                }
             }
         }
 
@@ -2031,22 +2737,22 @@
         }
         if (box && box.width > 0) svgOverrides.width = `${box.width}px`;
         if (box && box.height > 0) svgOverrides.height = `${box.height}px`;
-        clone.setAttribute('style', buildComputedCssText(cs, svgOverrides));
+        clone.setAttribute('style', buildComputedCssText(cs, svgOverrides, parentCs, 'SVG'));
         return clone;
     }
 
-    function createPseudoSpan(el, pseudoElt) {
+    function createPseudoSpan(el, pseudoElt, parentCs = null) {
         const pcs = safeGetComputedStyle(el, pseudoElt);
         if (!pcs || pcs.display === 'none') return null;
         const text = parsePseudoTextContent(pcs.content);
         if (!text) return null;
         const span = document.createElementNS(XHTML_NS, 'span');
         span.textContent = stripInvalidXmlChars(text);
-        span.setAttribute('style', buildComputedCssText(pcs));
+        span.setAttribute('style', buildComputedCssText(pcs, {}, parentCs, 'SPAN'));
         return span;
     }
 
-    function cloneNodeForSnapshot(node, state, viewportBounds) {
+    function cloneNodeForSnapshot(node, state, viewportBounds, parentCs = null) {
         if (!node || state.count >= MAX_CAPTURE_ELEMENTS) return null;
         if (node.nodeType === 3) {
             const cleanText = stripInvalidXmlChars(node.nodeValue || '');
@@ -2058,7 +2764,7 @@
         const tag = String(node.tagName || '').toUpperCase();
         if (SKIP_CAPTURE_TAGS.has(tag) || tag === 'SOURCE') return null;
         if (node.namespaceURI === SVG_NS) {
-            return cloneSvgForSnapshot(node, state, viewportBounds);
+            return cloneSvgForSnapshot(node, state, viewportBounds, parentCs);
         }
 
         const cs = safeGetComputedStyle(node);
@@ -2066,18 +2772,30 @@
 
         const box = typeof node.getBoundingClientRect === 'function' ? node.getBoundingClientRect() : null;
 
+        if (box && viewportBounds && node !== document.body && node !== document.documentElement) {
+            const clipX = Boolean(cs && cs.overflowX && cs.overflowX !== 'visible');
+            const clipY = Boolean(cs && cs.overflowY && cs.overflowY !== 'visible');
+            if (
+                (clipX && (box.right < viewportBounds.left - 40 || box.left > viewportBounds.right + 40))
+                || (clipY && (box.bottom < viewportBounds.top - 40 || box.top > viewportBounds.bottom + 40))
+            ) {
+                state.count++;
+                return createSnapshotPlaceholder(cs, box, parentCs, tag);
+            }
+        }
+
         state.count++;
 
         if (tag === 'IMG' || tag === 'CANVAS' || tag === 'VIDEO') {
             if (box && viewportBounds && !rectsIntersect(box, viewportBounds, 100)) {
-                return createSnapshotPlaceholder(cs, box);
+                return createSnapshotPlaceholder(cs, box, parentCs, tag);
             }
             const hasPreResolved = tag === 'VIDEO' && state && state.videoAssets && state.videoAssets.has(node);
             const dataUrl = hasPreResolved
                 ? ((state.videoAssets.get(node) && state.videoAssets.get(node).dataUrl) || null)
-                : safeImageToDataUrl(node);
+                : safeImageToDataUrl(node, 800, state ? state.scratchImage : null);
             if (!dataUrl) {
-                return createSnapshotPlaceholder(cs, box);
+                return createSnapshotPlaceholder(cs, box, parentCs, tag);
             }
             const imgClone = document.createElementNS(XHTML_NS, 'img');
             imgClone.setAttribute('src', dataUrl);
@@ -2087,12 +2805,12 @@
             if (tag === 'VIDEO' && (!cs || !cs.getPropertyValue('object-fit'))) {
                 imgOverrides['object-fit'] = 'contain';
             }
-            imgClone.setAttribute('style', buildComputedCssText(cs, imgOverrides));
+            imgClone.setAttribute('style', buildComputedCssText(cs, imgOverrides, parentCs, 'IMG'));
             return imgClone;
         }
 
         if (tag === 'IFRAME' || tag === 'OBJECT' || tag === 'EMBED') {
-            return createSnapshotPlaceholder(cs, box);
+            return createSnapshotPlaceholder(cs, box, parentCs, tag);
         }
 
         const clone = document.createElementNS(XHTML_NS, tag.toLowerCase());
@@ -2119,7 +2837,7 @@
             overrides['overflow-y'] = 'hidden';
         }
 
-        clone.setAttribute('style', buildComputedCssText(cs, overrides));
+        clone.setAttribute('style', buildComputedCssText(cs, overrides, parentCs, tag));
 
         if (tag === 'INPUT') {
             const inputType = String(node.type || 'text').toLowerCase();
@@ -2141,8 +2859,15 @@
         }
 
         if (tag === 'SELECT') {
-            const options = [...(node.options || [])];
-            const selectedOpt = options.find((opt) => opt.selected) || options[0];
+            const options = node.options || [];
+            let selectedOpt = null;
+            for (let i = 0; i < options.length; i++) {
+                if (options[i] && options[i].selected) {
+                    selectedOpt = options[i];
+                    break;
+                }
+            }
+            if (!selectedOpt && options.length) selectedOpt = options[0];
             if (selectedOpt) {
                 const optEl = document.createElementNS(XHTML_NS, 'option');
                 optEl.setAttribute('selected', 'selected');
@@ -2161,58 +2886,93 @@
             })()
             : clone;
 
-        const beforeSpan = createPseudoSpan(node, '::before');
+        const beforeSpan = createPseudoSpan(node, '::before', cs);
         if (beforeSpan) contentTarget.appendChild(beforeSpan);
 
-        for (const child of collectChildNodesForCapture(node)) {
+        const children = collectChildNodesForCapture(node);
+        for (let i = 0; i < children.length; i++) {
             if (state.count >= MAX_CAPTURE_ELEMENTS) break;
-            const clonedChild = cloneNodeForSnapshot(child, state, viewportBounds);
+            const clonedChild = cloneNodeForSnapshot(children[i], state, viewportBounds, cs);
             if (clonedChild) {
                 contentTarget.appendChild(clonedChild);
             }
         }
 
-        const afterSpan = createPseudoSpan(node, '::after');
+        const afterSpan = createPseudoSpan(node, '::after', cs);
         if (afterSpan) contentTarget.appendChild(afterSpan);
 
         return clone;
+    }
+
+    function checkImageDataBand(imgData, bandW, bandH, startY, totalHeight, step, r0, g0, b0, a0, counters) {
+        const yOffset = startY % step;
+        const firstLocalY = yOffset === 0 ? 0 : (step - yOffset);
+        for (let ly = firstLocalY; ly < bandH && (startY + ly) < totalHeight; ly += step) {
+            const rowBase = ly * bandW;
+            for (let x = 0; x < bandW; x += step) {
+                const idx = (rowBase + x) * 4;
+                const a = imgData[idx + 3];
+                if (a > 0) counters.opaqueCount++;
+                const delta = Math.abs(imgData[idx] - r0)
+                    + Math.abs(imgData[idx + 1] - g0)
+                    + Math.abs(imgData[idx + 2] - b0)
+                    + Math.abs(a - a0);
+                if (delta > 16) {
+                    counters.diffCount++;
+                    if (counters.diffCount >= MIN_VISUAL_CONTENT_PIXELS && counters.opaqueCount > 0) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     function canvasHasVisualContent(ctx, width, height) {
         if (!ctx || !width || !height) return false;
         if (typeof ctx.getImageData !== 'function') return true;
         try {
+            const totalPixels = width * height;
+            const step = Math.max(1, Math.min(4, Math.floor(Math.sqrt(totalPixels / 15000))));
+            const isRealCanvas = typeof HTMLCanvasElement !== 'undefined' && ctx.canvas instanceof HTMLCanvasElement;
+
+            if (isRealCanvas && totalPixels > 65536) {
+                const corner = ctx.getImageData(0, 0, 1, 1).data;
+                if (!corner || corner.length < 4) return false;
+                const r0 = corner[0];
+                const g0 = corner[1];
+                const b0 = corner[2];
+                const a0 = corner[3];
+                const counters = { opaqueCount: 0, diffCount: 0 };
+                const bandHeight = 64;
+                const bandCount = Math.ceil(height / bandHeight);
+                const midBand = Math.floor(bandCount / 3);
+                const order = [midBand];
+                if (midBand !== 0) order.push(0);
+                for (let b = 0; b < bandCount; b++) {
+                    if (b !== midBand && b !== 0) order.push(b);
+                }
+
+                for (let i = 0; i < order.length; i++) {
+                    const y = order[i] * bandHeight;
+                    const h = Math.min(bandHeight, height - y);
+                    const imgData = ctx.getImageData(0, y, width, h).data;
+                    if (imgData && imgData.length >= 4 && checkImageDataBand(imgData, width, h, y, height, step, r0, g0, b0, a0, counters)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
             const imgData = ctx.getImageData(0, 0, width, height).data;
             if (!imgData || imgData.length < 4) return false;
 
-            const totalPixels = width * height;
-            const step = Math.max(1, Math.min(4, Math.floor(Math.sqrt(totalPixels / 15000))));
             const r0 = imgData[0];
             const g0 = imgData[1];
             const b0 = imgData[2];
             const a0 = imgData[3];
-
-            let opaqueCount = 0;
-            let diffCount = 0;
-
-            for (let y = 0; y < height; y += step) {
-                for (let x = 0; x < width; x += step) {
-                    const idx = (y * width + x) * 4;
-                    const r = imgData[idx];
-                    const g = imgData[idx + 1];
-                    const b = imgData[idx + 2];
-                    const a = imgData[idx + 3];
-                    if (a > 0) opaqueCount++;
-                    const delta = Math.abs(r - r0) + Math.abs(g - g0) + Math.abs(b - b0) + Math.abs(a - a0);
-                    if (delta > 16) {
-                        diffCount++;
-                        if (diffCount >= MIN_VISUAL_CONTENT_PIXELS && opaqueCount > 0) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            return false;
+            const counters = { opaqueCount: 0, diffCount: 0 };
+            return checkImageDataBand(imgData, width, height, 0, height, step, r0, g0, b0, a0, counters);
         } catch (e) {
             return false;
         }
@@ -2268,6 +3028,11 @@
         });
     }
 
+    function encodeSvgDataUrl(svgXml) {
+        const encoded = svgXml.replace(/[\x00-\x20"#%&<>?\\^{|}\x7F-\uFFFF]/g, (ch) => encodeURIComponent(ch));
+        return `data:image/svg+xml;charset=utf-8,${encoded}`;
+    }
+
     async function captureViaForeignObject(rect, options = {}) {
         if (
             typeof document === 'undefined'
@@ -2287,6 +3052,8 @@
         const ownsVideoAssets = !(options && options.videoAssets);
         const videoAssets = (options && options.videoAssets)
             || await resolveViewportVideoAssets(viewportBounds, { needDataUrl: true });
+        const scratchImage = { canvas: null, ctx: null };
+        let outCanvas = null;
 
         try {
             const effectiveBg = getEffectivePageBackground();
@@ -2325,7 +3092,7 @@
                 'padding-bottom': '0',
                 'padding-left': '0',
                 'background-color': 'transparent'
-            }));
+            }, null, 'HTML'));
 
             const scrollFrame = document.createElementNS(XHTML_NS, 'div');
             scrollFrame.setAttribute('style', buildComputedCssText(bodyStyle, {
@@ -2345,12 +3112,13 @@
                 'background-color': bodyStyle && parseCssColorAlpha(bodyStyle.backgroundColor) > 0
                     ? bodyStyle.backgroundColor
                     : 'transparent'
-            }));
+            }, docStyle, 'BODY'));
 
-            const state = { count: 0, videoAssets };
-            for (const child of [...document.body.childNodes]) {
+            const state = { count: 0, videoAssets, scratchImage };
+            const bodyChildren = document.body.childNodes;
+            for (let i = 0; i < bodyChildren.length; i++) {
                 if (state.count >= MAX_CAPTURE_ELEMENTS) break;
-                const cloned = cloneNodeForSnapshot(child, state, viewportBounds);
+                const cloned = cloneNodeForSnapshot(bodyChildren[i], state, viewportBounds, bodyStyle);
                 if (cloned) {
                     scrollFrame.appendChild(cloned);
                 }
@@ -2360,8 +3128,11 @@
             fo.appendChild(viewportBox);
             svgRoot.appendChild(fo);
 
-            const svgXml = stripInvalidXmlChars(new XMLSerializer().serializeToString(svgRoot));
-            const svgDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgXml)}`;
+            const serialized = new XMLSerializer().serializeToString(svgRoot);
+            const svgXml = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/.test(serialized)
+                ? stripInvalidXmlChars(serialized)
+                : serialized;
+            const svgDataUrl = encodeSvgDataUrl(svgXml);
 
             const img = await new Promise((resolve) => {
                 const loader = new Image();
@@ -2383,10 +3154,10 @@
                 try { await img.decode(); } catch (e) {}
             }
 
-            const canvas = document.createElement('canvas');
-            canvas.width = rect.outWidth;
-            canvas.height = rect.outHeight;
-            const ctx = canvas.getContext && canvas.getContext('2d');
+            outCanvas = document.createElement('canvas');
+            outCanvas.width = rect.outWidth;
+            outCanvas.height = rect.outHeight;
+            const ctx = outCanvas.getContext && outCanvas.getContext('2d');
             if (!ctx) return null;
 
             ctx.drawImage(img, 0, 0, rect.outWidth, rect.outHeight);
@@ -2396,10 +3167,12 @@
 
             compositeCanvasBackground(ctx, rect.outWidth, rect.outHeight, effectiveBg);
 
-            const blob = await canvasToScreenshotBlob(canvas);
+            const blob = await canvasToScreenshotBlob(outCanvas);
             if (!blob) return null;
             return { blob, method: 'foreignObject', width: rect.outWidth, height: rect.outHeight };
         } finally {
+            releaseCanvas(outCanvas);
+            releaseCanvas(scratchImage.canvas);
             if (ownsVideoAssets) {
                 cleanupVideoAssets(videoAssets);
             }
@@ -2444,7 +3217,7 @@
         return best;
     }
 
-    function drawTextNodeOnCanvas(ctx, textNode, cs, viewportBounds) {
+    function drawTextNodeOnCanvas(ctx, textNode, cs, viewportBounds, drawState) {
         const rawText = String(nodeValueSafe(textNode) || '');
         if (!rawText.trim()) return;
         if (!cs || parseCssColorAlpha(cs.color) <= 0) return;
@@ -2453,15 +3226,29 @@
         const fontWeight = cs.fontWeight || '400';
         const fontSize = cs.fontSize || '14px';
         const fontFamily = cs.fontFamily || 'sans-serif';
-        ctx.font = `${fontStyle} ${fontWeight} ${fontSize} ${fontFamily}`;
-        ctx.fillStyle = cs.color;
-        ctx.textBaseline = 'middle';
+        const font = `${fontStyle} ${fontWeight} ${fontSize} ${fontFamily}`;
+        if (!drawState || drawState.lastFont !== font) {
+            ctx.font = font;
+            if (drawState) drawState.lastFont = font;
+        }
+        if (!drawState || drawState.lastFill !== cs.color) {
+            ctx.fillStyle = cs.color;
+            if (drawState) drawState.lastFill = cs.color;
+        }
+        if (!drawState || !drawState.baselineSet) {
+            ctx.textBaseline = 'middle';
+            if (drawState) drawState.baselineSet = true;
+        }
 
         const preserveWs = cs.whiteSpace === 'pre' || cs.whiteSpace === 'pre-wrap' || cs.whiteSpace === 'break-spaces';
-        if (typeof document.createRange !== 'function') return;
+        let range = drawState && drawState.range;
+        if (!range) {
+            if (typeof document.createRange !== 'function') return;
+            range = document.createRange();
+            if (drawState) drawState.range = range;
+        }
 
         try {
-            const range = document.createRange();
             range.selectNodeContents(textNode);
             if (typeof range.getClientRects !== 'function') return;
             const allRects = range.getClientRects();
@@ -2515,7 +3302,10 @@
         canvas.width = rect.outWidth;
         canvas.height = rect.outHeight;
         const ctx = canvas.getContext && canvas.getContext('2d');
-        if (!ctx) return null;
+        if (!ctx) {
+            releaseCanvas(canvas);
+            return null;
+        }
 
         const viewportBounds = {
             left: 0,
@@ -2531,6 +3321,7 @@
             ctx.save();
             ctx.scale(rect.scale, rect.scale);
 
+            const drawState = { lastFont: '', lastFill: '', baselineSet: false, range: null };
             let visited = 0;
             const paintElement = (el) => {
                 if (!el || visited >= MAX_CAPTURE_ELEMENTS) return;
@@ -2559,7 +3350,10 @@
                 if (isVisibleSelf && box && box.width > 0 && box.height > 0 && cs && rectsIntersect(box, viewportBounds, 8)) {
                     const bgAlpha = parseCssColorAlpha(cs.backgroundColor);
                     if (bgAlpha > 0) {
-                        ctx.fillStyle = cs.backgroundColor;
+                        if (drawState.lastFill !== cs.backgroundColor) {
+                            ctx.fillStyle = cs.backgroundColor;
+                            drawState.lastFill = cs.backgroundColor;
+                        }
                         traceRoundedRect(ctx, box.left, box.top, box.width, box.height, radius);
                         ctx.fill();
                     }
@@ -2600,11 +3394,13 @@
                     ctx.clip();
                 }
 
-                for (const child of collectChildNodesForCapture(el)) {
+                const children = collectChildNodesForCapture(el);
+                for (let i = 0; i < children.length; i++) {
                     if (visited >= MAX_CAPTURE_ELEMENTS) break;
+                    const child = children[i];
                     if (child.nodeType === 3) {
                         if (isVisibleSelf) {
-                            drawTextNodeOnCanvas(ctx, child, cs, viewportBounds);
+                            drawTextNodeOnCanvas(ctx, child, cs, viewportBounds, drawState);
                         }
                     } else if (child.nodeType === 1) {
                         paintElement(child);
@@ -2629,6 +3425,7 @@
             if (!blob) return null;
             return { blob, method: 'directCanvas', width: rect.outWidth, height: rect.outHeight };
         } finally {
+            releaseCanvas(canvas);
             if (ownsVideoAssets) {
                 cleanupVideoAssets(videoAssets);
             }
@@ -2815,7 +3612,7 @@
         ]);
     }
 
-    function buildCandidateImages(bookmark, cachedScrapedMeta) {
+    function buildCandidateImages(bookmark, cachedScrapedMeta, options = {}) {
         const seen = new Set();
         const candidates = [];
         const blockedMatchers = getBlockedThumbnailMatchers();
@@ -2830,7 +3627,8 @@
         if (bookmark) {
             pushLink(bookmark.cover);
             if (Array.isArray(bookmark.media)) {
-                for (const m of bookmark.media) {
+                for (let i = 0; i < bookmark.media.length; i++) {
+                    const m = bookmark.media[i];
                     if (m && m.link) pushLink(m.link);
                 }
             }
@@ -2839,18 +3637,22 @@
         if (cachedScrapedMeta) {
             pushLink(cachedScrapedMeta.cover);
             if (Array.isArray(cachedScrapedMeta.media)) {
-                for (const m of cachedScrapedMeta.media) {
+                for (let i = 0; i < cachedScrapedMeta.media.length; i++) {
+                    const m = cachedScrapedMeta.media[i];
                     if (m && m.link) pushLink(m.link);
                 }
             }
         }
 
-        const freshMeta = extractPageMeta();
-        if (freshMeta) {
-            pushLink(freshMeta.cover);
-            if (Array.isArray(freshMeta.media)) {
-                for (const m of freshMeta.media) {
-                    if (m && m.link) pushLink(m.link);
+        if (!options.skipFreshScrape) {
+            const freshMeta = options.freshMeta !== undefined ? options.freshMeta : extractPageMeta();
+            if (freshMeta) {
+                pushLink(freshMeta.cover);
+                if (Array.isArray(freshMeta.media)) {
+                    for (let i = 0; i < freshMeta.media.length; i++) {
+                        const m = freshMeta.media[i];
+                        if (m && m.link) pushLink(m.link);
+                    }
                 }
             }
         }
@@ -3759,9 +4561,11 @@
                 return;
             }
 
+            const epoch = renderEpoch;
             let triedFallback = false;
             imgEl.src = primarySrc;
             imgEl.addEventListener('error', async () => {
+                if (epoch !== renderEpoch) return;
                 if (triedFallback) {
                     if (typeof onFinalFail === 'function') onFinalFail();
                     return;
@@ -3775,6 +4579,12 @@
                 if (rdlSrc) {
                     try {
                         const blobUrl = await fetchRdlBlobUrl(rdlSrc);
+                        if (epoch !== renderEpoch || !host) {
+                            if (typeof URL.revokeObjectURL === 'function') {
+                                try { URL.revokeObjectURL(blobUrl); } catch (e) {}
+                            }
+                            return;
+                        }
                         objectUrls.add(blobUrl);
                         imgEl.src = blobUrl;
                         return;
@@ -3783,7 +4593,7 @@
                     }
                 }
 
-                if (typeof onFinalFail === 'function') onFinalFail();
+                if (epoch === renderEpoch && typeof onFinalFail === 'function') onFinalFail();
             });
         }
 
@@ -4199,6 +5009,9 @@
                         return;
                     }
                     chipsWrap.style.display = 'flex';
+                    const frag = typeof document.createDocumentFragment === 'function'
+                        ? document.createDocumentFragment()
+                        : chipsWrap;
                     for (const tag of tags) {
                         const chip = el('span', 'tag-chip');
                         chip.setAttribute('data-role', 'tag-chip');
@@ -4247,7 +5060,10 @@
                         });
 
                         chip.appendChild(removeBtn);
-                        chipsWrap.appendChild(chip);
+                        frag.appendChild(chip);
+                    }
+                    if (frag !== chipsWrap) {
+                        chipsWrap.appendChild(frag);
                     }
                 };
 
@@ -4448,6 +5264,9 @@
 
             const grid = el('div', 'grid-wrap');
             grid.setAttribute('data-role', 'thumb-grid');
+            const gridFrag = typeof document.createDocumentFragment === 'function'
+                ? document.createDocumentFragment()
+                : grid;
             const optionButtons = [];
             const blockButtons = [];
 
@@ -4475,6 +5294,8 @@
 
                 const img = el('img');
                 img.alt = '';
+                img.decoding = 'async';
+                img.loading = 'lazy';
                 attachImageWithFallback(img, link, currentBookmark && currentBookmark.link, () => {
                     img.remove();
                     optionBtn.appendChild(el('span', 'thumb-placeholder', 'Broken'));
@@ -4586,7 +5407,7 @@
                     tileWrap.appendChild(blockBtn);
                 }
 
-                grid.appendChild(tileWrap);
+                gridFrag.appendChild(tileWrap);
             }
 
             const captureBtn = el('button', 'thumb-option capture-tile');
@@ -4631,7 +5452,10 @@
             });
 
             optionButtons.push(captureBtn);
-            grid.appendChild(captureBtn);
+            gridFrag.appendChild(captureBtn);
+            if (gridFrag !== grid) {
+                grid.appendChild(gridFrag);
+            }
             body.appendChild(grid);
 
             if (pickerErrorMsg) {
@@ -5123,6 +5947,8 @@
             renderEpoch++;
             activeScreen = 'idle';
             minimizedView = null;
+            currentBookmark = null;
+            currentCandidates = [];
             currentPickerErrorMsg = '';
             currentSettingsOptions = null;
             returnView = { type: 'none' };
@@ -5168,29 +5994,83 @@
     // -------------------------------------------------------------------------
     // Save Pipeline (mirrors draftLoad / createBookmark / enrichCreated / cover)
     // -------------------------------------------------------------------------
-    const attemptedUrls = new Set();
-    const savedBookmarksByUrl = new Map();
-    const bookmarksById = new Map();
-    const deletedBookmarkIds = new Set();
-    const scrapedMetaByUrl = new Map();
+    const attemptedUrls = new BoundedSet(MAX_ATTEMPTED_URLS);
+    const urlsByBookmarkId = new Map();
+    let suppressCacheOnEvict = false;
+
+    const bookmarksById = new BoundedMap(MAX_CACHED_BOOKMARKS, (evictedId) => {
+        if (suppressCacheOnEvict) return;
+        const urls = urlsByBookmarkId.get(evictedId);
+        if (!urls) return;
+        urlsByBookmarkId.delete(evictedId);
+        suppressCacheOnEvict = true;
+        try {
+            for (const u of urls) {
+                const entry = savedBookmarksByUrl.get(u);
+                if (entry && entry._id === evictedId) {
+                    savedBookmarksByUrl.delete(u);
+                }
+            }
+        } finally {
+            suppressCacheOnEvict = false;
+        }
+    });
+
+    const savedBookmarksByUrl = new BoundedMap(MAX_CACHED_BOOKMARKS, (evictedUrl, evictedItem) => {
+        if (suppressCacheOnEvict || !evictedItem) return;
+        const bid = evictedItem._id;
+        if (bid === undefined || bid === null) return;
+        const urls = urlsByBookmarkId.get(bid);
+        if (!urls) return;
+        urls.delete(evictedUrl);
+        if (urls.size === 0) {
+            urlsByBookmarkId.delete(bid);
+            suppressCacheOnEvict = true;
+            try {
+                if (bookmarksById.get(bid) === evictedItem) {
+                    bookmarksById.delete(bid);
+                }
+            } finally {
+                suppressCacheOnEvict = false;
+            }
+        }
+    });
+
+    const deletedBookmarkIds = new BoundedSet(MAX_DELETED_IDS);
+    const scrapedMetaByUrl = new BoundedMap(MAX_SCRAPED_META);
     const inFlightPromises = new Map();
     const bookmarkUpdateQueues = new Map();
 
+    function registerBookmarkUrlAlias(bookmarkId, url) {
+        if (!url || bookmarkId === undefined || bookmarkId === null) return;
+        let urls = urlsByBookmarkId.get(bookmarkId);
+        if (!urls) {
+            urls = new Set();
+            urlsByBookmarkId.set(bookmarkId, urls);
+        }
+        urls.add(url);
+    }
+
     function cacheSavedBookmark(url, item) {
         if (!item) return;
+        const bid = item._id;
+        if (bid !== undefined && bid !== null) {
+            registerBookmarkUrlAlias(bid, url);
+            registerBookmarkUrlAlias(bid, item.link);
+            bookmarksById.set(bid, item);
+            const aliases = urlsByBookmarkId.get(bid);
+            if (aliases) {
+                for (const alias of aliases) {
+                    savedBookmarksByUrl.set(alias, item);
+                }
+                return;
+            }
+        }
         if (url) {
             savedBookmarksByUrl.set(url, item);
         }
-        if (item.link) {
+        if (item.link && item.link !== url) {
             savedBookmarksByUrl.set(item.link, item);
-        }
-        if (item._id !== undefined && item._id !== null) {
-            bookmarksById.set(item._id, item);
-            for (const [cachedUrl, cachedItem] of savedBookmarksByUrl.entries()) {
-                if (cachedItem && cachedItem._id === item._id) {
-                    savedBookmarksByUrl.set(cachedUrl, item);
-                }
-            }
         }
     }
 
@@ -5198,11 +6078,21 @@
         if (!bookmark) return;
         const bookmarkId = bookmark._id;
         if (bookmarkId !== undefined && bookmarkId !== null) {
-            bookmarksById.delete(bookmarkId);
-            for (const [cachedUrl, cachedItem] of savedBookmarksByUrl.entries()) {
-                if (cachedItem && cachedItem._id === bookmarkId) {
-                    savedBookmarksByUrl.delete(cachedUrl);
+            suppressCacheOnEvict = true;
+            try {
+                bookmarksById.delete(bookmarkId);
+                const aliases = urlsByBookmarkId.get(bookmarkId);
+                if (aliases) {
+                    urlsByBookmarkId.delete(bookmarkId);
+                    for (const alias of aliases) {
+                        const cachedItem = savedBookmarksByUrl.get(alias);
+                        if (cachedItem && cachedItem._id === bookmarkId) {
+                            savedBookmarksByUrl.delete(alias);
+                        }
+                    }
                 }
+            } finally {
+                suppressCacheOnEvict = false;
             }
         }
         if (bookmark.link && savedBookmarksByUrl.get(bookmark.link) === bookmark) {
@@ -5213,21 +6103,26 @@
     function getLatestCachedBookmark(bookmark) {
         if (!bookmark) return bookmark;
         if (bookmark._id !== undefined && bookmark._id !== null && bookmarksById.has(bookmark._id)) {
-            return bookmarksById.get(bookmark._id);
+            return bookmarksById.touch(bookmark._id);
         }
         if (bookmark.link && savedBookmarksByUrl.has(bookmark.link)) {
-            return savedBookmarksByUrl.get(bookmark.link);
+            return savedBookmarksByUrl.touch(bookmark.link);
         }
         return bookmark;
     }
 
     let sessionUserCollectionId = null;
     let sessionCollectionResolved = false;
+    let inFlightCollectionPromise = null;
     let pendingSaveTimer = null;
     let pendingSaveUrl = null;
     let pendingSaveDueAt = 0;
     let initialSaveTriggered = false;
     let domObserverAttached = false;
+    let domObserverActive = false;
+    let domObserverInstance = null;
+    let mutationCooldownTimer = null;
+    let urlWatchTimer = null;
     let domReadyListenerCleanup = null;
     let lastObservedUrl = typeof location !== 'undefined' ? location.href : '';
     let uiEpoch = 0;
@@ -5307,6 +6202,7 @@
         if (!nextEnabled) {
             cancelPendingSave();
         }
+        syncNavigationWatchers();
 
         if (nextDebug) {
             logDebug('Settings updated via overlay', {
@@ -5374,9 +6270,46 @@
         }
     });
 
-    function invalidateCollectionCache() {
+    function invalidateCollectionCache(options = {}) {
         sessionUserCollectionId = null;
         sessionCollectionResolved = false;
+        inFlightCollectionPromise = null;
+        if (!options.skipPersistentClear && typeof GM_setValue === 'function') {
+            gmSet(CACHE_STORAGE_KEYS.userCollection, null);
+        }
+    }
+
+    function readPersistentUserCollectionCache() {
+        const raw = gmGet(CACHE_STORAGE_KEYS.userCollection, null);
+        if (!raw) return null;
+        let parsed = raw;
+        if (typeof parsed === 'string') {
+            try {
+                parsed = JSON.parse(parsed);
+            } catch (e) {
+                return null;
+            }
+        }
+        if (!parsed || typeof parsed !== 'object') return null;
+        const cid = parseInt(parsed.collectionId, 10);
+        if (!Number.isFinite(cid) || cid === 0 || cid === -99) return null;
+        const now = Date.now();
+        if (typeof parsed.expiresAt !== 'number' || parsed.expiresAt <= now || parsed.expiresAt > now + USER_COLLECTION_CACHE_TTL_MS + 60000) {
+            return null;
+        }
+        if (parsed.authFingerprint !== getTokenAuthFingerprint()) {
+            return null;
+        }
+        return cid;
+    }
+
+    function writePersistentUserCollectionCache(collectionId) {
+        if (typeof GM_setValue !== 'function') return;
+        gmSet(CACHE_STORAGE_KEYS.userCollection, {
+            collectionId,
+            authFingerprint: getTokenAuthFingerprint(),
+            expiresAt: Date.now() + USER_COLLECTION_CACHE_TTL_MS
+        });
     }
 
     async function resolveTargetCollectionId() {
@@ -5389,26 +6322,44 @@
             return sessionUserCollectionId;
         }
 
-        try {
-            const res = await apiRequest('GET', 'user');
-            const config = (res && res.user && res.user.config) || {};
-            let resolved = parseInt(config.add_default_collection || config.last_collection || -1, 10);
-            if (!Number.isFinite(resolved) || resolved === 0 || resolved === -99) {
-                resolved = -1;
-            }
-            sessionUserCollectionId = resolved;
+        const cachedCrossTabId = readPersistentUserCollectionCache();
+        if (cachedCrossTabId !== null) {
+            sessionUserCollectionId = cachedCrossTabId;
             sessionCollectionResolved = true;
-            return resolved;
-        } catch (err) {
-            if (err && err.status === 401) throw err;
-            logWarn('Failed to resolve user default collection; falling back to Unsorted (-1)', {
-                url: typeof location !== 'undefined' ? location.href : '',
-                error: err
-            });
-            sessionUserCollectionId = -1;
-            sessionCollectionResolved = true;
-            return -1;
+            return cachedCrossTabId;
         }
+
+        if (inFlightCollectionPromise) {
+            return inFlightCollectionPromise;
+        }
+
+        inFlightCollectionPromise = (async () => {
+            try {
+                const res = await apiRequest('GET', 'user');
+                const config = (res && res.user && res.user.config) || {};
+                let resolved = parseInt(config.add_default_collection || config.last_collection || -1, 10);
+                if (!Number.isFinite(resolved) || resolved === 0 || resolved === -99) {
+                    resolved = -1;
+                }
+                sessionUserCollectionId = resolved;
+                sessionCollectionResolved = true;
+                writePersistentUserCollectionCache(resolved);
+                return resolved;
+            } catch (err) {
+                if (err && err.status === 401) throw err;
+                logWarn('Failed to resolve user default collection; falling back to Unsorted (-1)', {
+                    url: typeof location !== 'undefined' ? location.href : '',
+                    error: err
+                });
+                sessionUserCollectionId = -1;
+                sessionCollectionResolved = true;
+                return -1;
+            } finally {
+                inFlightCollectionPromise = null;
+            }
+        })();
+
+        return inFlightCollectionPromise;
     }
 
     async function enrichCreated(url, createdItem, options = {}) {
@@ -5427,7 +6378,9 @@
         }
 
         try {
-            const parse = await apiRequest('GET', `import/url/parse?url=${encodeURIComponent(url)}`);
+            const parse = options.preParsedResponse !== undefined
+                ? options.preParsedResponse
+                : await apiRequest('GET', `import/url/parse?url=${encodeURIComponent(url)}`);
             if (parse && !parse.error && parse.item) {
                 const parsedSanitized = sanitizeMediaAndCover(parse.item, matchers);
                 parsedBlockedCount = parsedSanitized.blockedCount;
@@ -5480,12 +6433,13 @@
             changed.pleaseParse = null;
         }
 
-        if (!Object.keys(changed).length) {
+        const changedKeys = Object.keys(changed);
+        if (!changedKeys.length) {
             return createdItem;
         }
 
         try {
-            logDebug('Enriching created bookmark via PUT', { url, bookmarkId: createdItem._id, fields: Object.keys(changed) });
+            logDebug('Enriching created bookmark via PUT', { url, bookmarkId: createdItem._id, fields: changedKeys });
             const updateRes = await apiRequest('PUT', `raindrop/${createdItem._id}`, changed);
             const merged = {
                 ...createdItem,
@@ -5687,8 +6641,9 @@
             }
         }
 
+        const freshMeta = extractPageMeta();
         const latestSanitized = sanitizeMediaAndCover(latest, matchers);
-        const candidatesAfter = buildCandidateImages(latest, targetUrl ? scrapedMetaByUrl.get(targetUrl) : null);
+        const candidatesAfter = buildCandidateImages(latest, targetUrl ? scrapedMetaByUrl.get(targetUrl) : null, { freshMeta });
         const remainingImages = candidatesAfter.filter((c) => c && c !== '<screenshot>');
 
         const currentCover = String((latest && latest.cover) || '').trim();
@@ -5757,10 +6712,13 @@
             }
         }
 
-        const finalCandidates = buildCandidateImages(
-            updatedBookmark,
-            targetUrl ? scrapedMetaByUrl.get(targetUrl) : null
-        );
+        const finalCandidates = updatedBookmark === latest
+            ? candidatesAfter
+            : buildCandidateImages(
+                updatedBookmark,
+                targetUrl ? scrapedMetaByUrl.get(targetUrl) : null,
+                { freshMeta }
+            );
 
         return {
             bookmark: updatedBookmark,
@@ -5804,10 +6762,12 @@
             tookScreenshot = true;
         }
 
-        const finalCandidates = buildCandidateImages(
-            updatedBookmark,
-            targetUrl ? scrapedMetaByUrl.get(targetUrl) : null
-        );
+        const finalCandidates = tookScreenshot
+            ? buildCandidateImages(
+                updatedBookmark,
+                targetUrl ? scrapedMetaByUrl.get(targetUrl) : null
+            )
+            : reconciled.candidates;
 
         return {
             bookmark: updatedBookmark,
@@ -5984,6 +6944,7 @@
     }
 
     function saveCurrentUrl(targetUrl = location.href, options = {}) {
+        refreshSettingsCache();
         const force = Boolean(options.force);
         const manual = Boolean(options.manual);
         const url = String(targetUrl || '');
@@ -5996,7 +6957,7 @@
         }
 
         if (manual && savedBookmarksByUrl.has(url)) {
-            const cached = savedBookmarksByUrl.get(url);
+            const cached = savedBookmarksByUrl.touch(url);
             if (!sanitizeMediaAndCover(cached).blockedCount) {
                 overlay.showSaved(cached, {
                     existing: true,
@@ -6066,7 +7027,7 @@
                     if (myEpoch === uiEpoch) {
                         overlay.showSaved(existingItem, {
                             existing: true,
-                            candidates: buildCandidateImages(existingItem, meta),
+                            candidates: buildCandidateImages(existingItem, meta, { skipFreshScrape: true }),
                             capturingScreenshot: needsExistingScreenshot
                         });
                     }
@@ -6088,18 +7049,19 @@
                     link: url
                 };
 
-                const hasBlockedPatterns = getBlockedThumbnails().length > 0;
+                const hasBlockedPatterns = getBlockedThumbnailsInternal().length > 0;
                 let suppressServerParse = !item.cover && hasBlockedPatterns;
+                let preParsedResponse;
 
                 if (item.title) {
                     if (!suppressServerParse) {
                         item.pleaseParse = { weight: 1 };
                     }
                 } else {
-                    const parsed = await apiRequest('GET', `import/url/parse?url=${encodeURIComponent(url)}`);
-                    if (parsed && parsed.item) {
-                        const sanitizedParsed = sanitizeMediaAndCover(parsed.item);
-                        const parsedItem = { ...parsed.item };
+                    preParsedResponse = await apiRequest('GET', `import/url/parse?url=${encodeURIComponent(url)}`);
+                    if (preParsedResponse && preParsedResponse.item) {
+                        const sanitizedParsed = sanitizeMediaAndCover(preParsedResponse.item);
+                        const parsedItem = { ...preParsedResponse.item };
                         if (sanitizedParsed.blockedCount > 0) {
                             logDebug('Filtered blocked thumbnails from pre-create parse', {
                                 url,
@@ -6147,20 +7109,23 @@
                 // Step 4: Post-create metadata enrichment (enrichCreated parity)
                 createdItem = await enrichCreated(url, createdItem, {
                     sentPleaseParse: Boolean(item.pleaseParse),
-                    suppressServerParse
+                    suppressServerParse,
+                    preParsedResponse
                 });
                 if (createdItem && createdItem._id !== undefined && createdItem._id !== null) {
                     deletedBookmarkIds.delete(createdItem._id);
                 }
                 cacheSavedBookmark(url, createdItem);
-                logDebug('Bookmark saved', { url, bookmarkId: createdItem._id, collectionId: getBookmarkCollectionId(createdItem) });
+                if (isDebugEnabled()) {
+                    logDebug('Bookmark saved', { url, bookmarkId: createdItem._id, collectionId: getBookmarkCollectionId(createdItem) });
+                }
 
                 const needsScreenshot = !hasBookmarkThumbnail(createdItem);
 
                 if (myEpoch === uiEpoch) {
                     overlay.showSaved(createdItem, {
                         existing: false,
-                        candidates: buildCandidateImages(createdItem, meta),
+                        candidates: buildCandidateImages(createdItem, meta, { skipFreshScrape: true }),
                         capturingScreenshot: needsScreenshot
                     });
                 }
@@ -6172,6 +7137,9 @@
                 // Step 5: Auto-capture simple viewport page screenshot when no thumbnail was found
                 return await attachAutoScreenshot(createdItem, url, meta, myEpoch);
             } catch (err) {
+                if (err && err.status === 401) {
+                    invalidateCollectionCache();
+                }
                 logError('Auto-save failed', { url, error: err });
                 if (myEpoch === uiEpoch) {
                     overlay.showError(err, url);
@@ -6194,6 +7162,17 @@
     function isDomReady() {
         return typeof document !== 'undefined'
             && (document.readyState === 'interactive' || document.readyState === 'complete');
+    }
+
+    function isPageHiddenState() {
+        return typeof document !== 'undefined'
+            && (document.visibilityState === 'hidden' || document.hidden === true);
+    }
+
+    function hasNativeNavigationApi() {
+        return typeof window !== 'undefined'
+            && Boolean(window.navigation)
+            && typeof window.navigation.addEventListener === 'function';
     }
 
     function cancelPendingSave() {
@@ -6246,23 +7225,115 @@
         scheduleSave(getSpaDelayMs(), nextUrl);
     }
 
+    function stopDomMutationObserver() {
+        if (mutationCooldownTimer !== null) {
+            clearTimeout(mutationCooldownTimer);
+            mutationCooldownTimer = null;
+        }
+        if (domObserverInstance) {
+            try { domObserverInstance.disconnect(); } catch (e) {}
+        }
+        domObserverActive = false;
+        domObserverAttached = false;
+    }
+
     function attachDomMutationObserver() {
-        if (domObserverAttached) return;
+        if (domObserverActive) return;
+        if (hasNativeNavigationApi() || isPageHiddenState() || !isEnabled() || isPermanentlyIneligibleContext()) return;
         if (typeof MutationObserver !== 'function' || typeof document === 'undefined') return;
         const target = document.documentElement || document;
         if (!target) return;
 
+        if (!domObserverInstance) {
+            domObserverInstance = new MutationObserver(() => {
+                if (!domObserverActive || isPageHiddenState() || !isEnabled()) return;
+                if (location.href !== lastObservedUrl) {
+                    handleUrlChange();
+                    return;
+                }
+                if (mutationCooldownTimer === null && domObserverInstance) {
+                    try { domObserverInstance.disconnect(); } catch (e) {}
+                    mutationCooldownTimer = setTimeout(() => {
+                        mutationCooldownTimer = null;
+                        if (!domObserverActive || isPageHiddenState() || !isEnabled()) return;
+                        if (location.href !== lastObservedUrl) {
+                            handleUrlChange();
+                        }
+                        if (domObserverActive && domObserverInstance && !isPageHiddenState() && isEnabled()) {
+                            const tgt = document.documentElement || document;
+                            if (tgt) {
+                                try {
+                                    domObserverInstance.observe(tgt, { childList: true, subtree: true });
+                                } catch (e) {}
+                            }
+                        }
+                    }, MUTATION_COOLDOWN_MS);
+                }
+            });
+        }
+
         domObserverAttached = true;
-        const observer = new MutationObserver(() => {
-            if (document.visibilityState === 'hidden') return;
-            if (location.href !== lastObservedUrl) {
-                handleUrlChange();
+        domObserverActive = true;
+        try {
+            domObserverInstance.observe(target, {
+                childList: true,
+                subtree: true
+            });
+        } catch (e) {
+            domObserverActive = false;
+            domObserverAttached = false;
+        }
+    }
+
+    function syncNavigationWatchers() {
+        if (isPermanentlyIneligibleContext()) {
+            stopDomMutationObserver();
+            if (urlWatchTimer !== null) {
+                clearInterval(urlWatchTimer);
+                urlWatchTimer = null;
             }
-        });
-        observer.observe(target, {
-            childList: true,
-            subtree: true
-        });
+            return;
+        }
+
+        const enabled = isEnabled();
+        const hidden = isPageHiddenState();
+        const shouldRunInterval = enabled && (!initialSaveTriggered || !hidden);
+        const shouldRunObserver = enabled && !hidden && !hasNativeNavigationApi() && (initialSaveTriggered || isDomReady());
+
+        if (shouldRunObserver) {
+            attachDomMutationObserver();
+        } else {
+            stopDomMutationObserver();
+        }
+
+        if (shouldRunInterval) {
+            if (urlWatchTimer === null) {
+                urlWatchTimer = setInterval(() => {
+                    if (!initialSaveTriggered && !document.prerendering && isDomReady()) {
+                        triggerInitialSave();
+                    }
+                    if (!isPageHiddenState() && location.href !== lastObservedUrl) {
+                        handleUrlChange();
+                    }
+                }, URL_WATCH_INTERVAL_MS);
+            }
+        } else if (urlWatchTimer !== null) {
+            clearInterval(urlWatchTimer);
+            urlWatchTimer = null;
+        }
+    }
+
+    function handleExternalEnabledChange(nextEnabled) {
+        if (!nextEnabled) {
+            cancelPendingSave();
+            syncNavigationWatchers();
+            return;
+        }
+        if (!initialSaveTriggered && !document.prerendering && isDomReady()) {
+            triggerInitialSave();
+        } else {
+            syncNavigationWatchers();
+        }
     }
 
     function cleanupDomReadyListeners() {
@@ -6277,8 +7348,8 @@
         if (typeof document !== 'undefined' && document.prerendering) return;
         initialSaveTriggered = true;
         cleanupDomReadyListeners();
-        attachDomMutationObserver();
         lastObservedUrl = location.href;
+        syncNavigationWatchers();
         scheduleSave(Math.min(INITIAL_LOAD_SETTLE_MS, getSpaDelayMs()), location.href);
     }
 
@@ -6319,6 +7390,7 @@
     }
 
     function startOnReady() {
+        if (isPermanentlyIneligibleContext()) return;
         if (typeof document !== 'undefined' && document.prerendering) {
             document.addEventListener('prerenderingchange', waitForDomReady, { once: true });
         } else {
@@ -6327,16 +7399,18 @@
     }
 
     function initNavigationHooks() {
+        if (isPermanentlyIneligibleContext()) return;
         window.addEventListener('popstate', handleUrlChange);
         window.addEventListener('hashchange', handleUrlChange);
 
-        if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+        if (hasNativeNavigationApi()) {
             window.navigation.addEventListener('navigatesuccess', handleUrlChange);
         }
 
         document.addEventListener('visibilitychange', () => {
             overlay.handleVisibilityChange();
-            if (document.visibilityState !== 'hidden') {
+            if (!isPageHiddenState()) {
+                refreshSettingsCache();
                 if (!initialSaveTriggered && !document.prerendering && isDomReady()) {
                     triggerInitialSave();
                 } else if (
@@ -6350,29 +7424,25 @@
                 }
                 handleUrlChange();
             }
+            syncNavigationWatchers();
+        });
+
+        window.addEventListener('focus', () => {
+            refreshSettingsCache();
         });
 
         window.addEventListener('pageshow', (event) => {
+            refreshSettingsCache();
             if (!initialSaveTriggered && !document.prerendering && isDomReady()) {
                 triggerInitialSave();
             } else if (event && event.persisted) {
                 handleUrlChange();
             }
             overlay.handleVisibilityChange();
+            syncNavigationWatchers();
         });
 
-        if (isDomReady()) {
-            attachDomMutationObserver();
-        }
-
-        setInterval(() => {
-            if (!initialSaveTriggered && !document.prerendering && isDomReady()) {
-                triggerInitialSave();
-            }
-            if (document.visibilityState !== 'hidden' && location.href !== lastObservedUrl) {
-                handleUrlChange();
-            }
-        }, URL_WATCH_INTERVAL_MS);
+        syncNavigationWatchers();
     }
 
     // -------------------------------------------------------------------------
@@ -6443,6 +7513,8 @@
     // -------------------------------------------------------------------------
     // Bootstrap (and test-harness hook when running inside isolated Node VM)
     // -------------------------------------------------------------------------
+    registerStorageChangeListeners();
+
     if (typeof globalThis !== 'undefined' && typeof globalThis.__RAINDROP_AUTOSAVE_TEST_EXPORT__ === 'function') {
         globalThis.__RAINDROP_AUTOSAVE_TEST_EXPORT__({
             extractPageMeta,
@@ -6514,7 +7586,9 @@
         });
     }
 
-    registerMenuCommands();
-    initNavigationHooks();
-    startOnReady();
+    if (!isPermanentlyIneligibleContext()) {
+        registerMenuCommands();
+        initNavigationHooks();
+        startOnReady();
+    }
 })();
