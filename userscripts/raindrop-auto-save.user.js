@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Raindrop.io Auto-Save Tab URL
 // @namespace    https://raindrop.io/
-// @version      1.1.0
-// @description  Automatically saves loaded and SPA-navigated tab URLs to Raindrop.io using the extension's save pipeline.
+// @version      1.2.0
+// @description  Automatically saves loaded, background, and SPA-navigated tab URLs to Raindrop.io using the extension's save pipeline.
 // @author       Raindrop.io Community
 // @match        http://*/*
 // @match        https://*/*
@@ -13,7 +13,7 @@
 // @exclude      http://127.0.0.1/*
 // @exclude      https://127.0.0.1/*
 // @noframes
-// @run-at       document-idle
+// @run-at       document-start
 // @connect      api.raindrop.io
 // @connect      rdl.ink
 // @grant        GM_xmlhttpRequest
@@ -42,6 +42,7 @@
         token: 'raindrop_token',
         collectionId: 'raindrop_collection_id',
         excludes: 'raindrop_excludes',
+        blockedThumbnails: 'raindrop_blocked_thumbnails',
         spaDelayMs: 'raindrop_spa_delay_ms',
         overlayTimeoutMs: 'raindrop_overlay_timeout_ms',
         debug: 'raindrop_debug'
@@ -51,6 +52,13 @@
     const DEFAULT_OVERLAY_TIMEOUT_MS = 8000;
     const INITIAL_LOAD_SETTLE_MS = 150;
     const URL_WATCH_INTERVAL_MS = 1000;
+    const SCREENSHOT_MAX_OUTPUT_WIDTH = 1280;
+    const SCREENSHOT_JPEG_QUALITY = 0.88;
+    const CAPTURE_READY_TIMEOUT_MS = 8000;
+    const CAPTURE_SETTLE_MS = 250;
+    const SVG_IMAGE_TIMEOUT_MS = 5000;
+    const MAX_CAPTURE_ELEMENTS = 6000;
+    const MIN_VISUAL_CONTENT_PIXELS = 24;
 
     const DEFAULT_EXCLUDE_PATTERNS = [
         '*://accounts.google.com/*',
@@ -70,6 +78,8 @@
         '/^https?:\\/\\/search\\.yahoo\\.com\\/search/i',
         '/^https?:\\/\\/(www\\.)?baidu\\.com\\/s(\\?|$)/i',
         '/^https?:\\/\\/yandex\\.[a-z.]+\\/search/i',
+        'https://yandex.com/*',
+        'https://bing.com/*',
         '/^https?:\\/\\/search\\.brave\\.com\\/search/i',
         '/^https?:\\/\\/kagi\\.com\\/search/i',
         '*://standardnotes.com/*',
@@ -82,6 +92,11 @@
         'https://instagram.com',
         'https://reddit.com',
         'https://youtube.com'
+    ];
+
+    const DEFAULT_BLOCKED_THUMBNAILS = [
+        'https://abs.twimg.com/x-web/assets/og/default-og.a2e144f0cf66.jpg',
+        'https://abs.twimg.com/rweb/ssr/default/v2/og/image.png'
     ];
 
     const HTML_ENTITIES = {
@@ -173,12 +188,68 @@
         return String(parsed);
     }
 
-    function getExcludes() {
-        const stored = gmGet(STORAGE_KEYS.excludes, null);
+    function normalizePatternList(input, { deduplicate = false } = {}) {
+        let source = input;
+        if (typeof source === 'string' && source.trim().startsWith('[')) {
+            try {
+                const parsed = JSON.parse(source);
+                if (Array.isArray(parsed)) source = parsed;
+            } catch (e) {}
+        }
+        const rawList = Array.isArray(source)
+            ? source
+            : String(source || '').split(/\r?\n/);
+        const cleaned = rawList.map((s) => String(s || '').trim()).filter(Boolean);
+        if (!deduplicate) return cleaned;
+        const seen = new Set();
+        const out = [];
+        for (const item of cleaned) {
+            if (seen.has(item)) continue;
+            seen.add(item);
+            out.push(item);
+        }
+        return out;
+    }
+
+    function readStoredPatternList(key) {
+        const stored = gmGet(key, null);
         if (Array.isArray(stored)) {
-            return stored.map((s) => String(s || '').trim()).filter(Boolean);
+            return { found: true, value: stored };
+        }
+        if (typeof stored === 'string' && stored.trim().startsWith('[')) {
+            try {
+                const parsed = JSON.parse(stored);
+                if (Array.isArray(parsed)) {
+                    return { found: true, value: parsed };
+                }
+            } catch (e) {}
+        }
+        return { found: false, value: null };
+    }
+
+    function getExcludes() {
+        const stored = readStoredPatternList(STORAGE_KEYS.excludes);
+        if (stored.found) {
+            return normalizePatternList(stored.value);
         }
         return [...DEFAULT_EXCLUDE_PATTERNS];
+    }
+
+    function getBlockedThumbnails() {
+        const stored = readStoredPatternList(STORAGE_KEYS.blockedThumbnails);
+        if (stored.found) {
+            return normalizePatternList(stored.value, { deduplicate: true });
+        }
+        return [...DEFAULT_BLOCKED_THUMBNAILS];
+    }
+
+    function addBlockedThumbnailPattern(pattern) {
+        const clean = String(pattern || '').trim();
+        if (!clean || clean === '<screenshot>') return false;
+        const existing = getBlockedThumbnails();
+        if (existing.includes(clean)) return false;
+        gmSet(STORAGE_KEYS.blockedThumbnails, [...existing, clean]);
+        return true;
     }
 
     function getSpaDelayMs() {
@@ -295,9 +366,37 @@
         return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
 
-    function compileExcludeMatcher(pattern) {
+    function safeDecodeUri(str) {
+        const raw = String(str || '');
+        if (!raw.includes('%')) return raw;
+        return raw.replace(/(?:%[0-9A-Fa-f]{2})+/g, (chunk) => {
+            try {
+                return decodeURIComponent(chunk);
+            } catch (e) {
+                return chunk.replace(/%[0-9A-Fa-f]{2}/g, (hex) => {
+                    try { return decodeURIComponent(hex); } catch (_e) { return hex; }
+                });
+            }
+        });
+    }
+
+    function extractRdlInnerUrl(url) {
+        const raw = String(url || '').trim();
+        if (!raw) return '';
+        const match = raw.match(/^https?:\/\/(?:rdl\.ink|stella\.raindrop\.io)\/render\/([^?#]+)/i);
+        if (!match || !match[1]) return '';
+        const decoded = safeDecodeUri(match[1]).trim();
+        if (/^(?:https?:)?\/\//i.test(decoded)) {
+            return decoded;
+        }
+        return '';
+    }
+
+    function compileUrlPatternMatcher(pattern, kindLabel = 'exclusion') {
         const raw = String(pattern || '').trim();
         if (!raw) return null;
+
+        const matchesRdlRenderTarget = /^(?:https?:|\*:)\/\/(?:rdl\.ink|stella\.raindrop\.io)\/render\//i.test(raw);
 
         if (raw.startsWith('/')) {
             const lastSlash = raw.lastIndexOf('/');
@@ -306,30 +405,100 @@
                 const flags = raw.slice(lastSlash + 1);
                 try {
                     const re = new RegExp(body, flags);
-                    return (url) => re.test(url);
+                    const matcher = (url) => {
+                        if (re.global || re.sticky) re.lastIndex = 0;
+                        return re.test(url);
+                    };
+                    matcher.matchesRdlRenderTarget = false;
+                    return matcher;
                 } catch (e) {
-                    logWarn('Invalid exclusion regex pattern', { pattern: raw, error: e });
+                    logWarn(`Invalid ${kindLabel} regex pattern`, { pattern: raw, error: e });
                     return null;
                 }
             }
         }
 
         if (raw.includes('*') || raw.includes('?')) {
-            const regexStr = '^' + raw
-                .split(/(\*|\?)/)
+            const parts = raw.split(/(\*|\?)/);
+            const rawRegexStr = '^' + parts
                 .map((part) => (part === '*' ? '.*' : part === '?' ? '.' : escapeRegExp(part)))
                 .join('') + '$';
+            const decodedRegexStr = '^' + parts
+                .map((part) => (part === '*' ? '.*' : part === '?' ? '.' : escapeRegExp(safeDecodeUri(part))))
+                .join('') + '$';
             try {
-                const re = new RegExp(regexStr, 'i');
-                return (url) => re.test(url);
+                const rawRe = new RegExp(rawRegexStr, 'i');
+                const decodedRe = new RegExp(decodedRegexStr, 'i');
+                const matcher = (url) => {
+                    const target = String(url || '');
+                    return rawRe.test(target) || decodedRe.test(safeDecodeUri(target));
+                };
+                matcher.matchesRdlRenderTarget = matchesRdlRenderTarget;
+                return matcher;
             } catch (e) {
-                logWarn('Invalid exclusion wildcard pattern', { pattern: raw, error: e });
+                logWarn(`Invalid ${kindLabel} wildcard pattern`, { pattern: raw, error: e });
                 return null;
             }
         }
 
-        const needle = raw.toLowerCase();
-        return (url) => url.toLowerCase().includes(needle);
+        const rawNeedle = raw.toLowerCase();
+        const decodedNeedle = safeDecodeUri(raw).toLowerCase();
+        const matcher = (url) => {
+            const target = String(url || '');
+            return target.toLowerCase().includes(rawNeedle)
+                || safeDecodeUri(target).toLowerCase().includes(decodedNeedle);
+        };
+        matcher.matchesRdlRenderTarget = matchesRdlRenderTarget;
+        return matcher;
+    }
+
+    function compileExcludeMatcher(pattern) {
+        return compileUrlPatternMatcher(pattern, 'exclusion');
+    }
+
+    function getBlockedThumbnailMatchers(patterns = getBlockedThumbnails()) {
+        const matchers = [];
+        for (const pattern of patterns) {
+            const matcher = compileUrlPatternMatcher(pattern, 'blocked thumbnail');
+            if (matcher) matchers.push(matcher);
+        }
+        return matchers;
+    }
+
+    function isThumbnailBlocked(url, matchers) {
+        const raw = typeof url === 'string' ? url.trim() : '';
+        if (!raw || raw === '<screenshot>') return false;
+
+        const compiled = Array.isArray(matchers) ? matchers : getBlockedThumbnailMatchers();
+        if (!compiled.length) return false;
+
+        const variants = [raw];
+        if (raw.startsWith('//')) {
+            variants.push(`https:${raw}`, `http:${raw}`);
+        }
+        const inner = extractRdlInnerUrl(raw);
+        if (inner) {
+            variants.push(inner);
+            if (inner.startsWith('//')) {
+                variants.push(`https:${inner}`, `http:${inner}`);
+            }
+        }
+
+        let rdlWrapped = null;
+        return compiled.some((matcher) => {
+            if (variants.some((candidate) => matcher(candidate))) {
+                return true;
+            }
+            if (matcher.matchesRdlRenderTarget) {
+                if (rdlWrapped === null) {
+                    rdlWrapped = getThumbUri(raw) || '';
+                }
+                if (rdlWrapped && matcher(rdlWrapped)) {
+                    return true;
+                }
+            }
+            return false;
+        });
     }
 
     function isBuiltInExcludedHost(hostname) {
@@ -480,6 +649,13 @@
         return json;
     }
 
+    function isFormDataBody(data) {
+        if (!data || typeof data !== 'object') return false;
+        if (typeof FormData !== 'undefined' && data instanceof FormData) return true;
+        return typeof data.append === 'function'
+            && Object.prototype.toString.call(data) === '[object FormData]';
+    }
+
     function gmRequestOnce(method, finalUrl, data, options = {}) {
         return new Promise((resolve, reject) => {
             if (typeof GM_xmlhttpRequest !== 'function') {
@@ -494,9 +670,14 @@
             };
 
             let body;
+            const formDataBody = isFormDataBody(data);
             if (data !== undefined && method !== 'GET' && method !== 'HEAD') {
-                headers['Content-Type'] = headers['Content-Type'] || 'application/json';
-                body = typeof data === 'string' ? data : JSON.stringify(data);
+                if (formDataBody) {
+                    body = data;
+                } else {
+                    headers['Content-Type'] = headers['Content-Type'] || 'application/json';
+                    body = typeof data === 'string' ? data : JSON.stringify(data);
+                }
             }
 
             const reqOptions = {
@@ -695,7 +876,7 @@
         return item;
     }
 
-    function grabImages() {
+    function grabImages(blockedMatchers = getBlockedThumbnailMatchers()) {
         const images = [];
 
         try {
@@ -716,7 +897,13 @@
                     } catch (e) {
                         logDebug('Failed to resolve image URL', { src, url: location.href, error: e });
                     }
-                    if (url) images.push(url);
+                    if (url) {
+                        if (isThumbnailBlocked(url, blockedMatchers)) {
+                            logDebug('Blocked page image candidate', { imageUrl: url, url: location.href });
+                            continue;
+                        }
+                        images.push(url);
+                    }
                 }
             }
         } catch (e) {
@@ -771,6 +958,7 @@
             || getMeta('twitter:title', 'og:title') == String(document.title || '').trim();
         const meta = (...keys) => (trustMeta ? getMeta(...keys) : null);
         const ld = getJsonLd();
+        const blockedMatchers = getBlockedThumbnailMatchers();
 
         const rawDocTitle = String(document.title || '');
         const strippedHost = escapeRegExp(String(location.hostname || '').replace('www.', ''));
@@ -801,6 +989,10 @@
         if (item.cover) {
             try {
                 item.cover = new URL(item.cover, location.href).href;
+                if (isThumbnailBlocked(item.cover, blockedMatchers)) {
+                    logDebug('Blocked meta/JSON-LD cover image', { cover: item.cover, url: location.href });
+                    delete item.cover;
+                }
             } catch (e) {
                 logWarn('Ignoring invalid meta cover URL', { cover: item.cover, url: location.href, error: e });
                 delete item.cover;
@@ -809,7 +1001,7 @@
 
         const images = [
             ...(item.cover ? [item.cover] : []),
-            ...grabImages()
+            ...grabImages(blockedMatchers)
         ].filter((value, index, self) => self.indexOf(value) === index);
 
         if (images.length) {
@@ -936,6 +1128,1089 @@
     }
 
     // -------------------------------------------------------------------------
+    // Client-Side Simple Full-Viewport Page Screenshot Capture
+    // -------------------------------------------------------------------------
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const XHTML_NS = 'http://www.w3.org/1999/xhtml';
+
+    const SKIP_CAPTURE_TAGS = new Set([
+        'SCRIPT', 'NOSCRIPT', 'STYLE', 'LINK', 'META', 'HEAD', 'TEMPLATE', 'BASE', 'AUDIO'
+    ]);
+
+    const SNAPSHOT_CSS_PROPS = [
+        'display', 'position', 'top', 'right', 'bottom', 'left', 'float', 'clear', 'z-index',
+        'box-sizing', 'width', 'height', 'min-width', 'max-width', 'min-height', 'max-height',
+        'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
+        'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+        'overflow-x', 'overflow-y', 'transform', 'transform-origin', 'opacity', 'visibility',
+        'flex-direction', 'flex-wrap', 'justify-content', 'align-items', 'align-content', 'align-self',
+        'flex-grow', 'flex-shrink', 'flex-basis', 'row-gap', 'column-gap',
+        'grid-template-columns', 'grid-template-rows', 'grid-column-start', 'grid-column-end',
+        'grid-row-start', 'grid-row-end',
+        'background-color', 'background-image', 'background-position', 'background-size', 'background-repeat',
+        'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
+        'border-top-style', 'border-right-style', 'border-bottom-style', 'border-left-style',
+        'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color',
+        'border-top-left-radius', 'border-top-right-radius', 'border-bottom-right-radius', 'border-bottom-left-radius',
+        'box-shadow', 'color', 'font-family', 'font-size', 'font-weight', 'font-style',
+        'line-height', 'letter-spacing', 'text-align', 'text-decoration-line', 'text-transform',
+        'white-space', 'word-break', 'overflow-wrap', 'vertical-align', 'object-fit', 'object-position',
+        'list-style-type', 'border-collapse', 'border-spacing'
+    ];
+
+    function sanitizeMediaAndCover(item, matchers = getBlockedThumbnailMatchers()) {
+        if (!item || typeof item !== 'object') {
+            return { cover: '', media: [], blockedCount: 0, coverBlocked: false, mediaBlocked: false };
+        }
+
+        let blockedCount = 0;
+        const rawMedia = Array.isArray(item.media) ? item.media : [];
+        const cleanMedia = [];
+        let mediaBlocked = false;
+        for (const entry of rawMedia) {
+            const link = entry && typeof entry.link === 'string' ? entry.link.trim() : '';
+            if (!link) continue;
+            if (isThumbnailBlocked(link, matchers)) {
+                blockedCount++;
+                mediaBlocked = true;
+                continue;
+            }
+            cleanMedia.push(entry);
+        }
+
+        const rawCover = typeof item.cover === 'string' ? item.cover.trim() : '';
+        const coverBlocked = Boolean(rawCover && isThumbnailBlocked(rawCover, matchers));
+        if (coverBlocked) {
+            blockedCount++;
+        }
+
+        let cleanCover = coverBlocked ? '' : rawCover;
+        if (!cleanCover && cleanMedia.length) {
+            cleanCover = String(cleanMedia[0].link || '').trim();
+        }
+
+        return {
+            cover: cleanCover,
+            media: cleanMedia,
+            blockedCount,
+            coverBlocked,
+            mediaBlocked
+        };
+    }
+
+    function hasBookmarkThumbnail(item) {
+        if (!item || typeof item !== 'object') return false;
+        const matchers = getBlockedThumbnailMatchers();
+        if (typeof item.cover === 'string' && item.cover.trim() && !isThumbnailBlocked(item.cover, matchers)) {
+            return true;
+        }
+        if (Array.isArray(item.media) && item.media.some((m) => m && typeof m.link === 'string' && m.link.trim() && !isThumbnailBlocked(m.link, matchers))) {
+            return true;
+        }
+        return false;
+    }
+
+    function getViewportCaptureRect() {
+        const docEl = typeof document !== 'undefined' ? document.documentElement : null;
+        const vw = Math.max(
+            1,
+            Math.round((typeof window !== 'undefined' && window.innerWidth) || (docEl && docEl.clientWidth) || 1280)
+        );
+        const vh = Math.max(
+            1,
+            Math.round((typeof window !== 'undefined' && window.innerHeight) || (docEl && docEl.clientHeight) || 800)
+        );
+        const x = 0;
+        const y = 0;
+        const width = vw;
+        const height = vh;
+        const scrollX = typeof window !== 'undefined' ? (window.scrollX || window.pageXOffset || 0) : 0;
+        const scrollY = typeof window !== 'undefined' ? (window.scrollY || window.pageYOffset || 0) : 0;
+        const dpr = Math.min(2, Math.max(1, (typeof window !== 'undefined' && Number(window.devicePixelRatio)) || 1));
+        const scale = Math.min(dpr, SCREENSHOT_MAX_OUTPUT_WIDTH / width);
+        const outWidth = Math.max(1, Math.round(width * scale));
+        const outHeight = Math.max(1, Math.round(height * scale));
+        return { vw, vh, x, y, width, height, scrollX, scrollY, scale, outWidth, outHeight };
+    }
+
+    function getCenterCropRect() {
+        return getViewportCaptureRect();
+    }
+
+    function parseCssColorAlpha(colorStr) {
+        const raw = String(colorStr || '').trim().toLowerCase();
+        if (!raw || raw === 'transparent' || raw === 'none') return 0;
+        const rgbaMatch = raw.match(/^rgba?\(\s*[\d.]+\s*[,\s]\s*[\d.]+\s*[,\s]\s*[\d.]+(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/);
+        if (rgbaMatch) {
+            if (rgbaMatch[1] === undefined) return 1;
+            const alpha = rgbaMatch[1].endsWith('%')
+                ? parseFloat(rgbaMatch[1]) / 100
+                : parseFloat(rgbaMatch[1]);
+            return Number.isFinite(alpha) ? alpha : 1;
+        }
+        return 1;
+    }
+
+    function safeGetComputedStyle(el, pseudoElt) {
+        try {
+            if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
+                return pseudoElt ? window.getComputedStyle(el, pseudoElt) : window.getComputedStyle(el);
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function getEffectivePageBackground() {
+        const docEl = typeof document !== 'undefined' ? document.documentElement : null;
+        const body = typeof document !== 'undefined' ? document.body : null;
+        const bodyStyle = body ? safeGetComputedStyle(body) : null;
+        const docStyle = docEl ? safeGetComputedStyle(docEl) : null;
+
+        if (bodyStyle && parseCssColorAlpha(bodyStyle.backgroundColor) > 0) {
+            return bodyStyle.backgroundColor;
+        }
+        if (docStyle && parseCssColorAlpha(docStyle.backgroundColor) > 0) {
+            return docStyle.backgroundColor;
+        }
+        const scheme = String((docStyle && docStyle.colorScheme) || (bodyStyle && bodyStyle.colorScheme) || '').toLowerCase();
+        if (scheme === 'dark' || scheme.startsWith('dark ')) {
+            return '#121212';
+        }
+        return '#ffffff';
+    }
+
+    function isOverlayHostElement(node) {
+        return Boolean(
+            node
+            && node.nodeType === 1
+            && typeof node.getAttribute === 'function'
+            && node.getAttribute('data-raindrop-autosave-overlay') === 'true'
+        );
+    }
+
+    function rectsIntersect(a, b, margin = 24) {
+        if (!a || !b) return true;
+        return !(
+            a.right < b.left - margin
+            || a.left > b.right + margin
+            || a.bottom < b.top - margin
+            || a.top > b.bottom + margin
+        );
+    }
+
+    function stripInvalidXmlChars(str) {
+        return String(str || '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '');
+    }
+
+    function splitCssLayers(value) {
+        const layers = [];
+        let depth = 0;
+        let quote = '';
+        let start = 0;
+        for (let i = 0; i < value.length; i++) {
+            const ch = value[i];
+            if (quote) {
+                if (ch === '\\') {
+                    i++;
+                } else if (ch === quote) {
+                    quote = '';
+                }
+                continue;
+            }
+            if (ch === '"' || ch === "'") {
+                quote = ch;
+            } else if (ch === '(') {
+                depth++;
+            } else if (ch === ')') {
+                depth = Math.max(0, depth - 1);
+            } else if (ch === ',' && depth === 0) {
+                layers.push(value.slice(start, i).trim());
+                start = i + 1;
+            }
+        }
+        layers.push(value.slice(start).trim());
+        return layers.filter(Boolean);
+    }
+
+    function sanitizeCssBackgroundImage(value) {
+        const raw = String(value || '').trim();
+        if (!raw || raw === 'none') return '';
+        if (!/url\(/i.test(raw)) return raw;
+        const safeLayers = splitCssLayers(raw).filter((layer) => {
+            if (!/url\(/i.test(layer)) return true;
+            return /^url\(\s*['"]?data:/i.test(layer);
+        });
+        return safeLayers.length ? safeLayers.join(', ') : 'none';
+    }
+
+    function safeImageToDataUrl(sourceEl, maxDim = 800) {
+        if (!sourceEl || typeof document === 'undefined') return null;
+        try {
+            const tag = String(sourceEl.tagName || '').toUpperCase();
+            if (tag === 'CANVAS') {
+                if (!sourceEl.width || !sourceEl.height) return null;
+                return sourceEl.toDataURL('image/png');
+            }
+
+            let srcW = 0;
+            let srcH = 0;
+            if (tag === 'IMG') {
+                const rawSrc = sourceEl.currentSrc || (typeof sourceEl.getAttribute === 'function' && sourceEl.getAttribute('src')) || sourceEl.src || '';
+                if (rawSrc.startsWith('data:')) return rawSrc;
+                if (!sourceEl.complete || !sourceEl.naturalWidth || !sourceEl.naturalHeight) return null;
+                srcW = sourceEl.naturalWidth;
+                srcH = sourceEl.naturalHeight;
+            } else if (tag === 'VIDEO') {
+                if ((sourceEl.readyState || 0) < 2 || !sourceEl.videoWidth || !sourceEl.videoHeight) return null;
+                srcW = sourceEl.videoWidth;
+                srcH = sourceEl.videoHeight;
+            } else {
+                return null;
+            }
+
+            const scale = Math.min(1, maxDim / Math.max(srcW, srcH));
+            const w = Math.max(1, Math.round(srcW * scale));
+            const h = Math.max(1, Math.round(srcH * scale));
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext && canvas.getContext('2d');
+            if (!ctx) return null;
+            ctx.drawImage(sourceEl, 0, 0, w, h);
+            return canvas.toDataURL('image/png');
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function isSourceDrawableSafe(sourceEl) {
+        if (!sourceEl || typeof document === 'undefined') return false;
+        try {
+            const tag = String(sourceEl.tagName || '').toUpperCase();
+            if (tag === 'CANVAS') {
+                if (!sourceEl.width || !sourceEl.height) return false;
+                sourceEl.toDataURL('image/png');
+                return true;
+            }
+            if (tag === 'IMG' || tag === 'VIDEO') {
+                if (tag === 'IMG') {
+                    if (!sourceEl.complete || !sourceEl.naturalWidth || !sourceEl.naturalHeight) return false;
+                    const rawSrc = sourceEl.currentSrc || (typeof sourceEl.getAttribute === 'function' && sourceEl.getAttribute('src')) || sourceEl.src || '';
+                    if (rawSrc.startsWith('data:')) return true;
+                } else {
+                    if ((sourceEl.readyState || 0) < 2 || !sourceEl.videoWidth || !sourceEl.videoHeight) return false;
+                }
+                const probe = document.createElement('canvas');
+                probe.width = 1;
+                probe.height = 1;
+                const pctx = probe.getContext && probe.getContext('2d');
+                if (!pctx) return false;
+                pctx.drawImage(sourceEl, 0, 0, 1, 1);
+                pctx.getImageData(0, 0, 1, 1);
+                return true;
+            }
+            return false;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function parsePseudoTextContent(rawContent) {
+        const raw = String(rawContent || '').trim();
+        if (!raw || raw === 'none' || raw === 'normal' || raw === 'open-quote' || raw === 'close-quote') {
+            return '';
+        }
+        const match = raw.match(/^(['"])([\s\S]*)\1$/);
+        if (!match) return '';
+        return match[2].replace(/\\(["'\\])/g, '$1');
+    }
+
+    function buildComputedCssText(cs, overrides = {}) {
+        const parts = [];
+        if (cs) {
+            for (const prop of SNAPSHOT_CSS_PROPS) {
+                if (Object.prototype.hasOwnProperty.call(overrides, prop)) continue;
+                let val = cs.getPropertyValue(prop);
+                if (!val) continue;
+                if (prop === 'background-image') {
+                    val = sanitizeCssBackgroundImage(val);
+                    if (!val || val === 'none') continue;
+                }
+                parts.push(`${prop}:${val}`);
+            }
+        }
+        for (const [prop, val] of Object.entries(overrides)) {
+            if (val !== undefined && val !== null && val !== '') {
+                parts.push(`${prop}:${val}`);
+            }
+        }
+        return stripInvalidXmlChars(parts.join(';'));
+    }
+
+    function createSnapshotPlaceholder(cs, box) {
+        const placeholder = document.createElementNS(XHTML_NS, 'div');
+        const overrides = {
+            display: cs && cs.display === 'inline' ? 'inline-block' : ((cs && cs.display) || 'block')
+        };
+        if (box && box.width > 0 && (!cs || cs.width === 'auto')) {
+            overrides.width = `${box.width}px`;
+        }
+        if (box && box.height > 0 && (!cs || cs.height === 'auto')) {
+            overrides.height = `${box.height}px`;
+        }
+        placeholder.setAttribute('style', buildComputedCssText(cs, overrides));
+        return placeholder;
+    }
+
+    function collectChildNodesForCapture(el) {
+        if (el.shadowRoot && el.shadowRoot.mode === 'open') {
+            return [...el.shadowRoot.childNodes];
+        }
+        if (String(el.tagName || '').toUpperCase() === 'SLOT' && typeof el.assignedNodes === 'function') {
+            const assigned = el.assignedNodes({ flatten: true });
+            if (assigned && assigned.length) return assigned;
+        }
+        return [...el.childNodes];
+    }
+
+    function cloneSvgForSnapshot(svgNode, state, viewportBounds) {
+        if (!svgNode || state.count >= MAX_CAPTURE_ELEMENTS) return null;
+        const cs = safeGetComputedStyle(svgNode);
+        if (cs && (cs.display === 'none' || parseFloat(cs.opacity || '1') <= 0)) return null;
+
+        const box = typeof svgNode.getBoundingClientRect === 'function' ? svgNode.getBoundingClientRect() : null;
+        if (box && viewportBounds && !rectsIntersect(box, viewportBounds, 40)) {
+            return createSnapshotPlaceholder(cs, box);
+        }
+
+        state.count++;
+        const clone = svgNode.cloneNode(true);
+        const queue = [clone];
+        while (queue.length) {
+            const cur = queue.shift();
+            if (!cur || cur.nodeType !== 1) continue;
+            const tag = String(cur.tagName || '').toLowerCase();
+            if (tag === 'script' || tag === 'foreignobject') {
+                cur.remove();
+                continue;
+            }
+            if (tag === 'image') {
+                const href = cur.getAttribute('href') || cur.getAttribute('xlink:href') || '';
+                if (href && !href.startsWith('data:')) {
+                    cur.remove();
+                    continue;
+                }
+            }
+            if (tag === 'use') {
+                const href = cur.getAttribute('href') || cur.getAttribute('xlink:href') || '';
+                if (href.startsWith('#') && typeof document.getElementById === 'function') {
+                    const target = document.getElementById(href.slice(1));
+                    if (target && !svgNode.contains(target)) {
+                        const defs = document.createElementNS(SVG_NS, 'defs');
+                        defs.appendChild(target.cloneNode(true));
+                        clone.insertBefore(defs, clone.firstChild);
+                    }
+                }
+            }
+            if (cur.children && cur.children.length) {
+                queue.push(...cur.children);
+            }
+        }
+
+        const svgOverrides = {};
+        if (cs) {
+            const fill = cs.getPropertyValue('fill');
+            const stroke = cs.getPropertyValue('stroke');
+            if (fill) svgOverrides.fill = fill;
+            if (stroke) svgOverrides.stroke = stroke;
+        }
+        if (box && box.width > 0) svgOverrides.width = `${box.width}px`;
+        if (box && box.height > 0) svgOverrides.height = `${box.height}px`;
+        clone.setAttribute('style', buildComputedCssText(cs, svgOverrides));
+        return clone;
+    }
+
+    function createPseudoSpan(el, pseudoElt) {
+        const pcs = safeGetComputedStyle(el, pseudoElt);
+        if (!pcs || pcs.display === 'none') return null;
+        const text = parsePseudoTextContent(pcs.content);
+        if (!text) return null;
+        const span = document.createElementNS(XHTML_NS, 'span');
+        span.textContent = stripInvalidXmlChars(text);
+        span.setAttribute('style', buildComputedCssText(pcs));
+        return span;
+    }
+
+    function cloneNodeForSnapshot(node, state, viewportBounds) {
+        if (!node || state.count >= MAX_CAPTURE_ELEMENTS) return null;
+        if (node.nodeType === 3) {
+            const cleanText = stripInvalidXmlChars(node.nodeValue || '');
+            return cleanText ? document.createTextNode(cleanText) : null;
+        }
+        if (node.nodeType !== 1) return null;
+        if (isOverlayHostElement(node)) return null;
+
+        const tag = String(node.tagName || '').toUpperCase();
+        if (SKIP_CAPTURE_TAGS.has(tag) || tag === 'SOURCE') return null;
+        if (node.namespaceURI === SVG_NS) {
+            return cloneSvgForSnapshot(node, state, viewportBounds);
+        }
+
+        const cs = safeGetComputedStyle(node);
+        if (cs && (cs.display === 'none' || parseFloat(cs.opacity || '1') <= 0)) return null;
+
+        const box = typeof node.getBoundingClientRect === 'function' ? node.getBoundingClientRect() : null;
+
+        state.count++;
+
+        if (tag === 'IMG' || tag === 'CANVAS' || tag === 'VIDEO') {
+            if (box && viewportBounds && !rectsIntersect(box, viewportBounds, 100)) {
+                return createSnapshotPlaceholder(cs, box);
+            }
+            const dataUrl = safeImageToDataUrl(node);
+            if (!dataUrl) {
+                return createSnapshotPlaceholder(cs, box);
+            }
+            const imgClone = document.createElementNS(XHTML_NS, 'img');
+            imgClone.setAttribute('src', dataUrl);
+            const imgOverrides = {};
+            if (box && box.width > 0) imgOverrides.width = `${box.width}px`;
+            if (box && box.height > 0) imgOverrides.height = `${box.height}px`;
+            imgClone.setAttribute('style', buildComputedCssText(cs, imgOverrides));
+            return imgClone;
+        }
+
+        if (tag === 'IFRAME' || tag === 'OBJECT' || tag === 'EMBED') {
+            return createSnapshotPlaceholder(cs, box);
+        }
+
+        const clone = document.createElementNS(XHTML_NS, tag.toLowerCase());
+        const overrides = {};
+
+        if (cs && cs.position === 'sticky' && box) {
+            overrides.position = 'fixed';
+            overrides.left = `${box.left}px`;
+            overrides.top = `${box.top}px`;
+            overrides.right = 'auto';
+            overrides.bottom = 'auto';
+            overrides.width = `${box.width}px`;
+            overrides.height = `${box.height}px`;
+            overrides['margin-top'] = '0';
+            overrides['margin-right'] = '0';
+            overrides['margin-bottom'] = '0';
+            overrides['margin-left'] = '0';
+        }
+
+        const scrollTop = Number(node.scrollTop) || 0;
+        const scrollLeft = Number(node.scrollLeft) || 0;
+        if ((scrollTop > 0 || scrollLeft > 0) && node !== document.body && node !== document.documentElement) {
+            overrides['overflow-x'] = 'hidden';
+            overrides['overflow-y'] = 'hidden';
+        }
+
+        clone.setAttribute('style', buildComputedCssText(cs, overrides));
+
+        if (tag === 'INPUT') {
+            const inputType = String(node.type || 'text').toLowerCase();
+            clone.setAttribute('type', inputType);
+            if (inputType === 'checkbox' || inputType === 'radio') {
+                if (node.checked) clone.setAttribute('checked', 'checked');
+            } else if (inputType !== 'password') {
+                clone.setAttribute('value', stripInvalidXmlChars(node.value || ''));
+            }
+            if (node.placeholder) {
+                clone.setAttribute('placeholder', stripInvalidXmlChars(node.placeholder));
+            }
+            return clone;
+        }
+
+        if (tag === 'TEXTAREA') {
+            clone.textContent = stripInvalidXmlChars(node.value || '');
+            return clone;
+        }
+
+        if (tag === 'SELECT') {
+            const options = [...(node.options || [])];
+            const selectedOpt = options.find((opt) => opt.selected) || options[0];
+            if (selectedOpt) {
+                const optEl = document.createElementNS(XHTML_NS, 'option');
+                optEl.setAttribute('selected', 'selected');
+                optEl.textContent = stripInvalidXmlChars(selectedOpt.textContent || '');
+                clone.appendChild(optEl);
+            }
+            return clone;
+        }
+
+        const contentTarget = ((scrollTop > 0 || scrollLeft > 0) && node !== document.body && node !== document.documentElement)
+            ? (() => {
+                const wrap = document.createElementNS(XHTML_NS, 'div');
+                wrap.setAttribute('style', `margin-left:${-scrollLeft}px;margin-top:${-scrollTop}px;`);
+                clone.appendChild(wrap);
+                return wrap;
+            })()
+            : clone;
+
+        const beforeSpan = createPseudoSpan(node, '::before');
+        if (beforeSpan) contentTarget.appendChild(beforeSpan);
+
+        for (const child of collectChildNodesForCapture(node)) {
+            if (state.count >= MAX_CAPTURE_ELEMENTS) break;
+            const clonedChild = cloneNodeForSnapshot(child, state, viewportBounds);
+            if (clonedChild) {
+                contentTarget.appendChild(clonedChild);
+            }
+        }
+
+        const afterSpan = createPseudoSpan(node, '::after');
+        if (afterSpan) contentTarget.appendChild(afterSpan);
+
+        return clone;
+    }
+
+    function canvasHasVisualContent(ctx, width, height) {
+        if (!ctx || !width || !height) return false;
+        if (typeof ctx.getImageData !== 'function') return true;
+        try {
+            const imgData = ctx.getImageData(0, 0, width, height).data;
+            if (!imgData || imgData.length < 4) return false;
+
+            const totalPixels = width * height;
+            const step = Math.max(1, Math.min(4, Math.floor(Math.sqrt(totalPixels / 15000))));
+            const r0 = imgData[0];
+            const g0 = imgData[1];
+            const b0 = imgData[2];
+            const a0 = imgData[3];
+
+            let opaqueCount = 0;
+            let diffCount = 0;
+
+            for (let y = 0; y < height; y += step) {
+                for (let x = 0; x < width; x += step) {
+                    const idx = (y * width + x) * 4;
+                    const r = imgData[idx];
+                    const g = imgData[idx + 1];
+                    const b = imgData[idx + 2];
+                    const a = imgData[idx + 3];
+                    if (a > 0) opaqueCount++;
+                    const delta = Math.abs(r - r0) + Math.abs(g - g0) + Math.abs(b - b0) + Math.abs(a - a0);
+                    if (delta > 16) {
+                        diffCount++;
+                        if (diffCount >= MIN_VISUAL_CONTENT_PIXELS && opaqueCount > 0) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function compositeCanvasBackground(ctx, width, height, backgroundColor) {
+        if (!ctx || !backgroundColor) return;
+        const prevOp = ctx.globalCompositeOperation;
+        ctx.globalCompositeOperation = 'destination-over';
+        ctx.fillStyle = backgroundColor;
+        ctx.fillRect(0, 0, width, height);
+        ctx.globalCompositeOperation = prevOp || 'source-over';
+    }
+
+    function canvasToScreenshotBlob(canvas) {
+        return new Promise((resolve) => {
+            if (!canvas) {
+                resolve(null);
+                return;
+            }
+            try {
+                if (typeof canvas.toBlob === 'function') {
+                    canvas.toBlob((blob) => {
+                        if (blob && blob.size > 0) {
+                            resolve(blob);
+                            return;
+                        }
+                        try {
+                            canvas.toBlob((pngBlob) => {
+                                resolve(pngBlob && pngBlob.size > 0 ? pngBlob : null);
+                            }, 'image/png');
+                        } catch (e) {
+                            resolve(null);
+                        }
+                    }, 'image/jpeg', SCREENSHOT_JPEG_QUALITY);
+                    return;
+                }
+                if (typeof canvas.toDataURL === 'function' && typeof Blob !== 'undefined') {
+                    const dataUrl = canvas.toDataURL('image/jpeg', SCREENSHOT_JPEG_QUALITY);
+                    const match = String(dataUrl || '').match(/^data:([^;]+);base64,(.+)$/);
+                    if (match && typeof atob === 'function') {
+                        const bin = atob(match[2]);
+                        const bytes = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) {
+                            bytes[i] = bin.charCodeAt(i);
+                        }
+                        resolve(new Blob([bytes], { type: match[1] }));
+                        return;
+                    }
+                }
+            } catch (e) {}
+            resolve(null);
+        });
+    }
+
+    async function captureViaForeignObject(rect) {
+        if (
+            typeof document === 'undefined'
+            || typeof XMLSerializer === 'undefined'
+            || typeof Image === 'undefined'
+            || !document.body
+        ) {
+            return null;
+        }
+
+        const viewportBounds = {
+            left: 0,
+            top: 0,
+            right: rect.width,
+            bottom: rect.height
+        };
+        const effectiveBg = getEffectivePageBackground();
+        const bodyStyle = safeGetComputedStyle(document.body);
+        const docStyle = safeGetComputedStyle(document.documentElement);
+        const bodyRect = typeof document.body.getBoundingClientRect === 'function'
+            ? document.body.getBoundingClientRect()
+            : { left: -rect.scrollX, top: -rect.scrollY, width: rect.width };
+
+        const svgRoot = document.createElementNS(SVG_NS, 'svg');
+        svgRoot.setAttribute('xmlns', SVG_NS);
+        svgRoot.setAttribute('width', String(rect.width));
+        svgRoot.setAttribute('height', String(rect.height));
+        svgRoot.setAttribute('viewBox', `0 0 ${rect.width} ${rect.height}`);
+
+        const fo = document.createElementNS(SVG_NS, 'foreignObject');
+        fo.setAttribute('x', '0');
+        fo.setAttribute('y', '0');
+        fo.setAttribute('width', String(rect.width));
+        fo.setAttribute('height', String(rect.height));
+
+        const viewportBox = document.createElementNS(XHTML_NS, 'div');
+        viewportBox.setAttribute('xmlns', XHTML_NS);
+        viewportBox.setAttribute('style', buildComputedCssText(docStyle, {
+            width: `${rect.width}px`,
+            height: `${rect.height}px`,
+            overflow: 'hidden',
+            position: 'relative',
+            transform: 'none',
+            'margin-top': '0',
+            'margin-right': '0',
+            'margin-bottom': '0',
+            'margin-left': '0',
+            'padding-top': '0',
+            'padding-right': '0',
+            'padding-bottom': '0',
+            'padding-left': '0',
+            'background-color': 'transparent'
+        }));
+
+        const scrollFrame = document.createElementNS(XHTML_NS, 'div');
+        scrollFrame.setAttribute('style', buildComputedCssText(bodyStyle, {
+            position: 'absolute',
+            left: `${bodyRect.left}px`,
+            top: `${bodyRect.top}px`,
+            width: `${Math.max(1, bodyRect.width || rect.width)}px`,
+            height: 'auto',
+            'box-sizing': 'border-box',
+            transform: 'none',
+            'margin-top': '0',
+            'margin-right': '0',
+            'margin-bottom': '0',
+            'margin-left': '0',
+            'overflow-x': 'visible',
+            'overflow-y': 'visible',
+            'background-color': bodyStyle && parseCssColorAlpha(bodyStyle.backgroundColor) > 0
+                ? bodyStyle.backgroundColor
+                : 'transparent'
+        }));
+
+        const state = { count: 0 };
+        for (const child of [...document.body.childNodes]) {
+            if (state.count >= MAX_CAPTURE_ELEMENTS) break;
+            const cloned = cloneNodeForSnapshot(child, state, viewportBounds);
+            if (cloned) {
+                scrollFrame.appendChild(cloned);
+            }
+        }
+
+        viewportBox.appendChild(scrollFrame);
+        fo.appendChild(viewportBox);
+        svgRoot.appendChild(fo);
+
+        const svgXml = stripInvalidXmlChars(new XMLSerializer().serializeToString(svgRoot));
+        const svgDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgXml)}`;
+
+        const img = await new Promise((resolve) => {
+            const loader = new Image();
+            let done = false;
+            const finish = (result) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                resolve(result);
+            };
+            const timer = setTimeout(() => finish(null), SVG_IMAGE_TIMEOUT_MS);
+            loader.onload = () => finish(loader);
+            loader.onerror = () => finish(null);
+            loader.src = svgDataUrl;
+        });
+
+        if (!img) return null;
+        if (typeof img.decode === 'function') {
+            try { await img.decode(); } catch (e) {}
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = rect.outWidth;
+        canvas.height = rect.outHeight;
+        const ctx = canvas.getContext && canvas.getContext('2d');
+        if (!ctx) return null;
+
+        ctx.drawImage(img, 0, 0, rect.outWidth, rect.outHeight);
+        if (!canvasHasVisualContent(ctx, rect.outWidth, rect.outHeight)) {
+            return null;
+        }
+
+        compositeCanvasBackground(ctx, rect.outWidth, rect.outHeight, effectiveBg);
+
+        const blob = await canvasToScreenshotBlob(canvas);
+        if (!blob) return null;
+        return { blob, method: 'foreignObject', width: rect.outWidth, height: rect.outHeight };
+    }
+
+    function traceRoundedRect(ctx, x, y, w, h, r) {
+        const radius = Math.max(0, Math.min(r || 0, w / 2, h / 2));
+        ctx.beginPath();
+        if (radius <= 0) {
+            ctx.rect(x, y, w, h);
+            return;
+        }
+        ctx.moveTo(x + radius, y);
+        ctx.lineTo(x + w - radius, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+        ctx.lineTo(x + w, y + h - radius);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+        ctx.lineTo(x + radius, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+        ctx.lineTo(x, y + radius);
+        ctx.quadraticCurveTo(x, y, x + radius, y);
+        ctx.closePath();
+    }
+
+    function findLineEndIndex(range, textNode, startIdx, maxLen) {
+        let low = startIdx + 1;
+        let high = maxLen;
+        let best = low;
+        while (low <= high) {
+            const mid = (low + high) >> 1;
+            range.setStart(textNode, startIdx);
+            range.setEnd(textNode, mid);
+            const rects = range.getClientRects();
+            if (rects.length <= 1) {
+                best = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return best;
+    }
+
+    function drawTextNodeOnCanvas(ctx, textNode, cs, viewportBounds) {
+        const rawText = String(nodeValueSafe(textNode) || '');
+        if (!rawText.trim()) return;
+        if (!cs || parseCssColorAlpha(cs.color) <= 0) return;
+
+        const fontStyle = cs.fontStyle || 'normal';
+        const fontWeight = cs.fontWeight || '400';
+        const fontSize = cs.fontSize || '14px';
+        const fontFamily = cs.fontFamily || 'sans-serif';
+        ctx.font = `${fontStyle} ${fontWeight} ${fontSize} ${fontFamily}`;
+        ctx.fillStyle = cs.color;
+        ctx.textBaseline = 'middle';
+
+        const preserveWs = cs.whiteSpace === 'pre' || cs.whiteSpace === 'pre-wrap' || cs.whiteSpace === 'break-spaces';
+        if (typeof document.createRange !== 'function') return;
+
+        try {
+            const range = document.createRange();
+            range.selectNodeContents(textNode);
+            if (typeof range.getClientRects !== 'function') return;
+            const allRects = range.getClientRects();
+            if (!allRects || !allRects.length) return;
+
+            if (allRects.length === 1) {
+                const r = allRects[0];
+                if (!rectsIntersect(r, viewportBounds, 8)) return;
+                const lineText = preserveWs ? rawText : rawText.replace(/\s+/g, ' ').trim();
+                if (lineText) {
+                    ctx.fillText(lineText, r.left, r.top + r.height / 2);
+                }
+                return;
+            }
+
+            const maxLen = Math.min(rawText.length, 1500);
+            let idx = 0;
+            let guard = 0;
+            while (idx < maxLen && guard < 60) {
+                guard++;
+                const endIdx = findLineEndIndex(range, textNode, idx, maxLen);
+                range.setStart(textNode, idx);
+                range.setEnd(textNode, endIdx);
+                const lineRects = range.getClientRects();
+                const r = lineRects && lineRects[0];
+                if (r && rectsIntersect(r, viewportBounds, 8)) {
+                    const slice = rawText.slice(idx, endIdx);
+                    const lineText = preserveWs ? slice : slice.replace(/\s+/g, ' ').trim();
+                    if (lineText) {
+                        ctx.fillText(lineText, r.left, r.top + r.height / 2);
+                    }
+                }
+                if (endIdx <= idx) break;
+                idx = endIdx;
+            }
+        } catch (e) {}
+    }
+
+    function nodeValueSafe(textNode) {
+        try {
+            return textNode.nodeValue;
+        } catch (e) {
+            return '';
+        }
+    }
+
+    async function captureViaDirectCanvas(rect) {
+        if (typeof document === 'undefined' || !document.body) return null;
+
+        const canvas = document.createElement('canvas');
+        canvas.width = rect.outWidth;
+        canvas.height = rect.outHeight;
+        const ctx = canvas.getContext && canvas.getContext('2d');
+        if (!ctx) return null;
+
+        const viewportBounds = {
+            left: 0,
+            top: 0,
+            right: rect.width,
+            bottom: rect.height
+        };
+
+        ctx.save();
+        ctx.scale(rect.scale, rect.scale);
+
+        let visited = 0;
+        const paintElement = (el) => {
+            if (!el || visited >= MAX_CAPTURE_ELEMENTS) return;
+            if (el.nodeType !== 1 || isOverlayHostElement(el)) return;
+            const tag = String(el.tagName || '').toUpperCase();
+            if (SKIP_CAPTURE_TAGS.has(tag) || tag === 'SOURCE') return;
+
+            const cs = safeGetComputedStyle(el);
+            if (cs && (cs.display === 'none' || parseFloat(cs.opacity || '1') <= 0)) {
+                return;
+            }
+
+            const box = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+            const clipX = Boolean(cs && (cs.overflowX === 'hidden' || cs.overflowX === 'clip'));
+            const clipY = Boolean(cs && (cs.overflowY === 'hidden' || cs.overflowY === 'clip'));
+            if (box) {
+                if (clipX && (box.right < -8 || box.left > rect.width + 8)) return;
+                if (clipY && (box.bottom < -8 || box.top > rect.height + 8)) return;
+            }
+
+            visited++;
+
+            const isVisibleSelf = !cs || cs.visibility !== 'hidden';
+            const radius = cs ? (parseFloat(cs.borderTopLeftRadius || '0') || 0) : 0;
+
+            if (isVisibleSelf && box && box.width > 0 && box.height > 0 && cs && rectsIntersect(box, viewportBounds, 8)) {
+                const bgAlpha = parseCssColorAlpha(cs.backgroundColor);
+                if (bgAlpha > 0) {
+                    ctx.fillStyle = cs.backgroundColor;
+                    traceRoundedRect(ctx, box.left, box.top, box.width, box.height, radius);
+                    ctx.fill();
+                }
+
+                const borderW = parseFloat(cs.borderTopWidth || '0') || 0;
+                if (borderW > 0 && cs.borderTopStyle !== 'none' && parseCssColorAlpha(cs.borderTopColor) > 0) {
+                    ctx.strokeStyle = cs.borderTopColor;
+                    ctx.lineWidth = Math.min(borderW, 6);
+                    traceRoundedRect(ctx, box.left, box.top, box.width, box.height, radius);
+                    ctx.stroke();
+                }
+
+                if ((tag === 'IMG' || tag === 'CANVAS' || tag === 'VIDEO') && isSourceDrawableSafe(el)) {
+                    try {
+                        ctx.drawImage(el, box.left, box.top, box.width, box.height);
+                    } catch (e) {}
+                }
+            }
+
+            const shouldClipChildren = Boolean(clipX && clipY && box && box.width > 0 && box.height > 0 && el !== document.body);
+            if (shouldClipChildren) {
+                ctx.save();
+                traceRoundedRect(ctx, box.left, box.top, box.width, box.height, radius);
+                ctx.clip();
+            }
+
+            for (const child of collectChildNodesForCapture(el)) {
+                if (visited >= MAX_CAPTURE_ELEMENTS) break;
+                if (child.nodeType === 3) {
+                    if (isVisibleSelf) {
+                        drawTextNodeOnCanvas(ctx, child, cs, viewportBounds);
+                    }
+                } else if (child.nodeType === 1) {
+                    paintElement(child);
+                }
+            }
+
+            if (shouldClipChildren) {
+                ctx.restore();
+            }
+        };
+
+        paintElement(document.body);
+        ctx.restore();
+
+        if (!canvasHasVisualContent(ctx, rect.outWidth, rect.outHeight)) {
+            return null;
+        }
+
+        compositeCanvasBackground(ctx, rect.outWidth, rect.outHeight, getEffectivePageBackground());
+
+        const blob = await canvasToScreenshotBlob(canvas);
+        if (!blob) return null;
+        return { blob, method: 'directCanvas', width: rect.outWidth, height: rect.outHeight };
+    }
+
+    async function captureSimpleViewportScreenshot() {
+        const rect = getViewportCaptureRect();
+
+        try {
+            const primary = await captureViaForeignObject(rect);
+            if (primary && primary.blob) {
+                return primary;
+            }
+        } catch (err) {
+            logWarn('ForeignObject screenshot capture failed; falling back to direct canvas', {
+                url: typeof location !== 'undefined' ? location.href : '',
+                error: err
+            });
+        }
+
+        try {
+            const secondary = await captureViaDirectCanvas(rect);
+            if (secondary && secondary.blob) {
+                return secondary;
+            }
+        } catch (err) {
+            logWarn('Direct canvas screenshot capture failed', {
+                url: typeof location !== 'undefined' ? location.href : '',
+                error: err
+            });
+        }
+
+        return null;
+    }
+
+    async function captureCenterPageScreenshot() {
+        return captureSimpleViewportScreenshot();
+    }
+
+    async function waitForPageReadyForCapture(targetUrl, options = {}) {
+        const maxWaitMs = typeof options.maxWaitMs === 'number' ? options.maxWaitMs : CAPTURE_READY_TIMEOUT_MS;
+        const settleMs = typeof options.settleMs === 'number' ? options.settleMs : CAPTURE_SETTLE_MS;
+        const url = String(targetUrl || '');
+
+        if (typeof location !== 'undefined' && url && location.href !== url) {
+            return { ready: false, navigatedAway: true, timedOut: false };
+        }
+
+        let timedOut = false;
+        if (typeof document !== 'undefined' && document.readyState !== 'complete') {
+            await new Promise((resolve) => {
+                let finished = false;
+                let maxTimer = null;
+                let urlPoll = null;
+
+                const finish = (didTimeout) => {
+                    if (finished) return;
+                    finished = true;
+                    timedOut = Boolean(didTimeout);
+                    if (maxTimer !== null) clearTimeout(maxTimer);
+                    if (urlPoll !== null) clearInterval(urlPoll);
+                    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+                        window.removeEventListener('load', onReady);
+                    }
+                    if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+                        document.removeEventListener('readystatechange', onReadyStateChange);
+                    }
+                    resolve();
+                };
+
+                const onReady = () => finish(false);
+                const onReadyStateChange = () => {
+                    if (document.readyState === 'complete') finish(false);
+                };
+
+                if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+                    window.addEventListener('load', onReady, { once: true });
+                }
+                if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+                    document.addEventListener('readystatechange', onReadyStateChange);
+                }
+
+                urlPoll = setInterval(() => {
+                    if (typeof location !== 'undefined' && url && location.href !== url) {
+                        finish(false);
+                    } else if (typeof document !== 'undefined' && document.readyState === 'complete') {
+                        finish(false);
+                    }
+                }, 200);
+
+                maxTimer = setTimeout(() => finish(true), Math.max(0, maxWaitMs));
+            });
+        }
+
+        if (typeof location !== 'undefined' && url && location.href !== url) {
+            return { ready: false, navigatedAway: true, timedOut };
+        }
+
+        if (!timedOut && settleMs > 0) {
+            await sleep(settleMs);
+        }
+
+        if (typeof location !== 'undefined' && url && location.href !== url) {
+            return { ready: false, navigatedAway: true, timedOut };
+        }
+
+        if (
+            typeof document !== 'undefined'
+            && document.visibilityState === 'visible'
+            && typeof requestAnimationFrame === 'function'
+        ) {
+            await new Promise((resolve) => {
+                const safety = setTimeout(resolve, 100);
+                requestAnimationFrame(() => {
+                    clearTimeout(safety);
+                    resolve();
+                });
+            });
+        }
+
+        const navigatedAway = typeof location !== 'undefined' && Boolean(url) && location.href !== url;
+        return { ready: !navigatedAway, navigatedAway, timedOut };
+    }
+
+    // -------------------------------------------------------------------------
     // Bookmark Normalization & Candidate Image Aggregation
     // -------------------------------------------------------------------------
     function getBookmarkCollectionId(item) {
@@ -984,10 +2259,11 @@
     function buildCandidateImages(bookmark, cachedScrapedMeta) {
         const seen = new Set();
         const candidates = [];
+        const blockedMatchers = getBlockedThumbnailMatchers();
 
         const pushLink = (raw) => {
             const link = typeof raw === 'string' ? raw.trim() : '';
-            if (!link || seen.has(link)) return;
+            if (!link || seen.has(link) || isThumbnailBlocked(link, blockedMatchers)) return;
             seen.add(link);
             candidates.push(link);
         };
@@ -1044,10 +2320,63 @@
             font-size: 13px;
             line-height: 1.4;
         }
-        .card[data-screen="saving"] {
+        .card[data-screen="saving"],
+        .card[data-screen="notice"] {
             width: auto;
             min-width: 210px;
             max-width: 300px;
+        }
+        .mini-bar {
+            pointer-events: auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 2px;
+            padding: 3px;
+            background: #ffffff;
+            color: #1c1e21;
+            border: 1px solid #eab308;
+            border-radius: 999px;
+            box-shadow: 0 8px 22px rgba(15, 23, 42, 0.16);
+        }
+        .mini-btn {
+            appearance: none;
+            border: none;
+            background: transparent;
+            color: #475569;
+            width: 24px;
+            height: 24px;
+            border-radius: 999px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            padding: 0;
+            flex-shrink: 0;
+            transition: background 0.15s ease, color 0.15s ease;
+        }
+        .mini-btn:hover {
+            background: rgba(15, 23, 42, 0.08);
+        }
+        .mini-btn:focus-visible {
+            outline: 2px solid #0c84e4;
+            outline-offset: 1px;
+        }
+        .mini-show-btn {
+            color: #0c84e4;
+        }
+        .mini-show-btn:hover {
+            background: rgba(12, 132, 228, 0.12);
+            color: #0284c7;
+        }
+        .mini-remove-btn:hover {
+            background: rgba(220, 38, 38, 0.1);
+            color: #dc2626;
+        }
+        .mini-icon {
+            width: 15px;
+            height: 15px;
+            display: block;
+            flex-shrink: 0;
         }
         .card[data-screen="picker"],
         .card[data-screen="settings"] {
@@ -1059,6 +2388,29 @@
                 color: #f1f3f5;
                 border-color: #eab308;
                 box-shadow: 0 12px 34px rgba(0, 0, 0, 0.45);
+            }
+            .mini-bar {
+                background: #1d2025;
+                color: #f1f3f5;
+                border-color: #eab308;
+                box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45);
+            }
+            .mini-btn {
+                color: #cbd5e1 !important;
+            }
+            .mini-btn:hover {
+                background: rgba(255, 255, 255, 0.1) !important;
+            }
+            .mini-show-btn {
+                color: #38bdf8 !important;
+            }
+            .mini-show-btn:hover {
+                background: rgba(56, 189, 248, 0.16) !important;
+                color: #7dd3fc !important;
+            }
+            .mini-remove-btn:hover {
+                background: rgba(248, 113, 113, 0.16) !important;
+                color: #fca5a5 !important;
             }
             .header {
                 border-bottom-color: rgba(255, 255, 255, 0.08) !important;
@@ -1080,6 +2432,18 @@
                 background: #2a2f37 !important;
                 border-color: rgba(255, 255, 255, 0.12) !important;
             }
+            .thumb-option.capture-tile {
+                background: rgba(56, 189, 248, 0.1) !important;
+                border-color: rgba(125, 211, 252, 0.35) !important;
+                color: #7dd3fc !important;
+            }
+            .thumb-option.capture-tile:hover:not(:disabled) {
+                border-color: #38bdf8 !important;
+                background: rgba(56, 189, 248, 0.18) !important;
+            }
+            .picker-hint {
+                color: #9aa4b2 !important;
+            }
             .action-btn {
                 background: rgba(255, 255, 255, 0.1) !important;
                 color: #f1f3f5 !important;
@@ -1089,7 +2453,8 @@
                 color: #f1f3f5 !important;
                 border-color: rgba(255, 255, 255, 0.16) !important;
             }
-            .fav-btn {
+            .fav-btn,
+            .delete-btn {
                 border-color: rgba(255, 255, 255, 0.16) !important;
                 color: #cbd5e1 !important;
             }
@@ -1102,6 +2467,11 @@
                 background: rgba(244, 63, 94, 0.2) !important;
                 border-color: rgba(251, 113, 133, 0.45) !important;
                 color: #fb7185 !important;
+            }
+            .delete-btn:hover:not(:disabled) {
+                background: rgba(248, 113, 113, 0.16) !important;
+                border-color: rgba(248, 113, 113, 0.45) !important;
+                color: #fca5a5 !important;
             }
             .tags-section {
                 border-top-color: rgba(255, 255, 255, 0.08) !important;
@@ -1129,7 +2499,8 @@
             padding: 9px 12px;
             border-bottom: 1px solid rgba(15, 23, 42, 0.08);
         }
-        .card[data-screen="saving"] .header {
+        .card[data-screen="saving"] .header,
+        .card[data-screen="notice"] .header {
             border-bottom: none;
             padding: 10px 12px;
         }
@@ -1285,7 +2656,8 @@
         .open-link:hover {
             text-decoration: underline;
         }
-        .fav-btn {
+        .fav-btn,
+        .delete-btn {
             appearance: none;
             display: inline-flex;
             align-items: center;
@@ -1311,7 +2683,13 @@
             border-color: rgba(225, 29, 72, 0.35);
             color: #e11d48;
         }
-        .fav-btn:disabled {
+        .delete-btn:hover:not(:disabled) {
+            background: rgba(220, 38, 38, 0.08);
+            border-color: rgba(220, 38, 38, 0.35);
+            color: #dc2626;
+        }
+        .fav-btn:disabled,
+        .delete-btn:disabled {
             cursor: wait;
             opacity: 0.65;
         }
@@ -1418,8 +2796,13 @@
             grid-template-columns: repeat(3, 1fr);
             gap: 8px;
         }
+        .thumb-tile {
+            position: relative;
+            height: 68px;
+        }
         .thumb-option {
             position: relative;
+            width: 100%;
             height: 68px;
             padding: 0;
             border-radius: 8px;
@@ -1430,6 +2813,40 @@
             display: flex;
             align-items: center;
             justify-content: center;
+        }
+        .thumb-block-btn {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            z-index: 2;
+            appearance: none;
+            border: 1px solid rgba(255, 255, 255, 0.28);
+            border-radius: 999px;
+            padding: 1px 6px;
+            height: 18px;
+            background: rgba(15, 23, 42, 0.8);
+            color: #ffffff;
+            font-size: 10px;
+            font-weight: 600;
+            line-height: 1;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            opacity: 0.85;
+            transition: opacity 0.15s ease, background 0.15s ease;
+        }
+        .thumb-tile:hover .thumb-block-btn,
+        .thumb-block-btn:focus-visible {
+            opacity: 1;
+        }
+        .thumb-block-btn:hover:not(:disabled) {
+            background: #dc2626;
+            border-color: rgba(255, 255, 255, 0.55);
+        }
+        .thumb-block-btn:disabled {
+            cursor: wait;
+            opacity: 0.35;
         }
         .thumb-option:hover:not(:disabled) {
             border-color: #0284c7;
@@ -1447,6 +2864,43 @@
             height: 100%;
             object-fit: cover;
             display: block;
+        }
+        .thumb-option.capture-tile {
+            flex-direction: column;
+            gap: 4px;
+            border-style: dashed;
+            border-color: rgba(12, 132, 228, 0.45);
+            background: rgba(12, 132, 228, 0.06);
+            color: #0369a1;
+            font-size: 11px;
+            font-weight: 600;
+            line-height: 1.2;
+            padding: 4px;
+        }
+        .thumb-option.capture-tile:hover:not(:disabled) {
+            background: rgba(12, 132, 228, 0.13);
+            border-color: #0284c7;
+        }
+        .capture-tile-icon {
+            width: 18px;
+            height: 18px;
+            display: block;
+            flex-shrink: 0;
+        }
+        .picker-hint {
+            margin: 0 0 8px 0;
+            font-size: 12px;
+            color: #64748b;
+        }
+        .thumb-placeholder-stack {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            padding: 4px;
+            font-size: 10.5px;
+            color: #64748b;
         }
         .tile-spinner {
             position: absolute;
@@ -1583,6 +3037,8 @@
         let styleEl = null;
         let rootEl = null;
         let dismissTimer = null;
+        let dismissDeadline = null;
+        let pausedDismissRemainingMs = null;
         let pickerOpened = false;
         let autoHideCancelledPermanently = false;
         let isHovered = false;
@@ -1591,8 +3047,14 @@
         let currentBookmark = null;
         let currentWasExisting = false;
         let currentCandidates = [];
+        let currentPickerErrorMsg = '';
+        let currentSettingsOptions = null;
+        let minimizedView = null;
         let isUpdatingThumb = false;
         let isUpdatingFavorite = false;
+        let isDeletingBookmark = false;
+        let isCapturingScreenshot = false;
+        let activeThumbBtn = null;
         let pendingTagOps = 0;
         let renderEpoch = 0;
         let returnView = { type: 'none' };
@@ -1609,31 +3071,83 @@
             objectUrls.clear();
         }
 
-        function clearDismissTimer() {
+        function isPageHidden() {
+            return typeof document !== 'undefined'
+                && (document.visibilityState === 'hidden' || document.hidden === true);
+        }
+
+        function clearDismissTimer({ preserveRemaining = false } = {}) {
             if (dismissTimer !== null) {
+                if (preserveRemaining && dismissDeadline !== null) {
+                    pausedDismissRemainingMs = Math.max(0, dismissDeadline - Date.now());
+                } else if (!preserveRemaining) {
+                    pausedDismissRemainingMs = null;
+                }
                 clearTimeout(dismissTimer);
                 dismissTimer = null;
+                dismissDeadline = null;
+            } else if (!preserveRemaining) {
+                pausedDismissRemainingMs = null;
             }
         }
 
         function scheduleAutoDismiss() {
-            clearDismissTimer();
+            if (isPageHidden()) {
+                if (dismissTimer !== null) {
+                    clearDismissTimer({ preserveRemaining: true });
+                }
+                return;
+            }
             if (
                 autoHideCancelledPermanently ||
                 pickerOpened ||
                 isHovered ||
                 isTagInputFocused ||
                 isUpdatingFavorite ||
+                isDeletingBookmark ||
+                isCapturingScreenshot ||
                 pendingTagOps > 0
             ) {
+                clearDismissTimer();
                 return;
             }
-            if (activeScreen !== 'saved' && activeScreen !== 'existing') return;
+            if (activeScreen !== 'saved' && activeScreen !== 'existing') {
+                clearDismissTimer();
+                return;
+            }
             const timeoutMs = getOverlayTimeoutMs();
-            if (timeoutMs <= 0) return;
+            if (timeoutMs <= 0) {
+                clearDismissTimer();
+                return;
+            }
+
+            const delayMs = pausedDismissRemainingMs !== null
+                ? Math.min(timeoutMs, Math.max(500, pausedDismissRemainingMs))
+                : timeoutMs;
+
+            clearDismissTimer();
+            dismissDeadline = Date.now() + delayMs;
             dismissTimer = setTimeout(() => {
-                hide();
-            }, timeoutMs);
+                dismissTimer = null;
+                dismissDeadline = null;
+                pausedDismissRemainingMs = null;
+                minimize();
+            }, delayMs);
+        }
+
+        function handleVisibilityChange() {
+            if (isPageHidden()) {
+                if (dismissTimer !== null) {
+                    clearDismissTimer({ preserveRemaining: true });
+                }
+                return;
+            }
+            if (activeScreen !== 'idle') {
+                ensureMounted();
+            }
+            if (activeScreen === 'saved' || activeScreen === 'existing') {
+                scheduleAutoDismiss();
+            }
         }
 
         function ensureMounted() {
@@ -1715,10 +3229,16 @@
         }
 
         function buildCard(screenName) {
+            clearDismissTimer();
             ensureMounted();
             clearRoot();
+            minimizedView = null;
+            if (screenName !== 'picker') currentPickerErrorMsg = '';
+            if (screenName !== 'settings') currentSettingsOptions = null;
             isTagInputFocused = false;
             isUpdatingFavorite = false;
+            isDeletingBookmark = false;
+            activeThumbBtn = null;
             pendingTagOps = 0;
             renderEpoch++;
             activeScreen = screenName;
@@ -1773,9 +3293,23 @@
                 return;
             }
             if (target.type === 'saved' || target.type === 'existing') {
+                if (
+                    target.bookmark
+                    && target.bookmark._id
+                    && sanitizeMediaAndCover(target.bookmark).blockedCount > 0
+                    && typeof callbacks.onSaveNow === 'function'
+                ) {
+                    callbacks.onSaveNow();
+                    return;
+                }
+                const latestCandidates = typeof callbacks.getCandidates === 'function'
+                    ? callbacks.getCandidates(target.bookmark)
+                    : target.candidates;
                 showSaved(target.bookmark, {
                     existing: target.type === 'existing',
-                    candidates: target.candidates
+                    candidates: latestCandidates,
+                    capturingScreenshot: Boolean(target.capturingScreenshot),
+                    preserveAutoHide: true
                 });
                 return;
             }
@@ -1810,8 +3344,10 @@
 
         function showNotice(text) {
             pickerOpened = false;
+            autoHideCancelledPermanently = false;
+            isHovered = false;
             returnView = { type: 'none' };
-            const card = buildCard('saving');
+            const card = buildCard('notice');
             const header = el('div', 'header');
             const left = el('div', 'header-left');
             const status = el('span', 'status-pill status-info', text);
@@ -1828,18 +3364,61 @@
             }
         }
 
-        function showSaved(bookmark, { existing = false, candidates = [], forceRender = false } = {}) {
+        function renderThumbButtonContent(thumbBtn, bookmark, capturing = false) {
+            if (!thumbBtn) return;
+            while (thumbBtn.firstChild) {
+                thumbBtn.removeChild(thumbBtn.firstChild);
+            }
+
+            const renderPlaceholder = () => {
+                while (thumbBtn.firstChild) thumbBtn.removeChild(thumbBtn.firstChild);
+                if (capturing) {
+                    const stack = el('span', 'thumb-placeholder-stack');
+                    stack.setAttribute('data-role', 'thumb-capturing');
+                    stack.appendChild(el('span', 'spinner'));
+                    stack.appendChild(el('span', '', 'Capturing…'));
+                    thumbBtn.appendChild(stack);
+                } else {
+                    thumbBtn.appendChild(el('span', 'thumb-placeholder', 'No cover'));
+                }
+                thumbBtn.appendChild(el('span', 'thumb-badge', 'Change'));
+            };
+
+            if (bookmark && bookmark.cover) {
+                const img = el('img', 'thumb-img');
+                img.setAttribute('data-role', 'thumb-img');
+                img.alt = '';
+                attachImageWithFallback(img, bookmark.cover, bookmark.link, renderPlaceholder);
+                thumbBtn.appendChild(img);
+                thumbBtn.appendChild(el('span', 'thumb-badge', 'Change'));
+            } else {
+                renderPlaceholder();
+            }
+        }
+
+        function showSaved(bookmark, {
+            existing = false,
+            candidates = [],
+            forceRender = false,
+            capturingScreenshot = false,
+            preserveAutoHide = false
+        } = {}) {
             currentBookmark = bookmark;
             currentWasExisting = existing;
             currentCandidates = Array.isArray(candidates) ? candidates : [];
             pickerOpened = false;
+            if (!preserveAutoHide) {
+                autoHideCancelledPermanently = false;
+            }
             isUpdatingThumb = false;
+            isCapturingScreenshot = Boolean(capturingScreenshot);
 
             const screenName = existing ? 'existing' : 'saved';
             returnView = {
                 type: screenName,
                 bookmark: currentBookmark,
-                candidates: currentCandidates
+                candidates: currentCandidates,
+                capturingScreenshot: isCapturingScreenshot
             };
 
             // Avoid interrupting active Settings editing if a background save finishes
@@ -1865,25 +3444,11 @@
             thumbBtn.type = 'button';
             thumbBtn.setAttribute('data-role', 'thumb-btn');
             thumbBtn.title = 'Click to pick another thumbnail';
-
-            const renderPlaceholder = () => {
-                while (thumbBtn.firstChild) thumbBtn.removeChild(thumbBtn.firstChild);
-                thumbBtn.appendChild(el('span', 'thumb-placeholder', 'No cover'));
-                thumbBtn.appendChild(el('span', 'thumb-badge', 'Change'));
-            };
-
-            if (bookmark && bookmark.cover) {
-                const img = el('img', 'thumb-img');
-                img.setAttribute('data-role', 'thumb-img');
-                img.alt = '';
-                attachImageWithFallback(img, bookmark.cover, bookmark.link, renderPlaceholder);
-                thumbBtn.appendChild(img);
-                thumbBtn.appendChild(el('span', 'thumb-badge', 'Change'));
-            } else {
-                renderPlaceholder();
-            }
+            activeThumbBtn = thumbBtn;
+            renderThumbButtonContent(thumbBtn, bookmark, isCapturingScreenshot);
 
             thumbBtn.addEventListener('click', () => {
+                if (isDeletingBookmark) return;
                 pickerOpened = true;
                 autoHideCancelledPermanently = true;
                 clearDismissTimer();
@@ -1929,19 +3494,32 @@
                 favBtn.type = 'button';
                 favBtn.setAttribute('data-role', 'favorite-btn');
 
+                const deleteBtn = el('button', 'delete-btn', 'Delete');
+                deleteBtn.type = 'button';
+                deleteBtn.setAttribute('data-role', 'delete-btn');
+                deleteBtn.setAttribute('aria-label', 'Delete bookmark');
+                deleteBtn.title = 'Move bookmark to Trash';
+
                 const syncFavoriteButton = () => {
                     const isFav = Boolean(currentBookmark && currentBookmark.important);
                     favBtn.setAttribute('aria-pressed', isFav ? 'true' : 'false');
                     favBtn.setAttribute('aria-busy', isUpdatingFavorite ? 'true' : 'false');
-                    favBtn.disabled = isUpdatingFavorite;
+                    favBtn.disabled = isUpdatingFavorite || isDeletingBookmark;
                     favBtn.title = isFav ? 'Remove from favorites' : 'Add to favorites';
-                    favBtn.textContent = isFav ? '♥ Favorited' : '♡ Favorite';
+                    favBtn.textContent = isFav ? '♥ Fav' : '♡ Fav';
+                };
+
+                const syncDeleteButton = () => {
+                    deleteBtn.setAttribute('aria-busy', isDeletingBookmark ? 'true' : 'false');
+                    deleteBtn.disabled = isDeletingBookmark;
+                    deleteBtn.textContent = isDeletingBookmark ? 'Deleting…' : 'Delete';
                 };
 
                 syncFavoriteButton();
+                syncDeleteButton();
 
                 favBtn.addEventListener('click', async () => {
-                    if (isUpdatingFavorite || !currentBookmark || !currentBookmark._id) return;
+                    if (isUpdatingFavorite || isDeletingBookmark || !currentBookmark || !currentBookmark._id) return;
                     isUpdatingFavorite = true;
                     clearDismissTimer();
                     hideActionError();
@@ -1971,14 +3549,49 @@
                     }
                 });
 
-                const openLink = el('a', 'open-link', 'Open in Raindrop ↗');
+                deleteBtn.addEventListener('click', async () => {
+                    if (isDeletingBookmark || !currentBookmark || !currentBookmark._id) return;
+                    isDeletingBookmark = true;
+                    clearDismissTimer();
+                    hideActionError();
+                    syncDeleteButton();
+                    syncFavoriteButton();
+
+                    let deleted = false;
+                    try {
+                        await callbacks.onDeleteBookmark(currentBookmark);
+                        deleted = true;
+                        if (cardEpoch !== renderEpoch) return;
+                        currentBookmark = null;
+                        showNotice('Deleted');
+                    } catch (err) {
+                        logError('Failed to delete bookmark', {
+                            url: currentBookmark && currentBookmark.link,
+                            bookmarkId: currentBookmark && currentBookmark._id,
+                            error: err
+                        });
+                        if (cardEpoch !== renderEpoch) return;
+                        showActionError((err && err.message) || 'Failed to delete bookmark.');
+                    } finally {
+                        if (!deleted && cardEpoch === renderEpoch) {
+                            isDeletingBookmark = false;
+                            syncDeleteButton();
+                            syncFavoriteButton();
+                            scheduleAutoDismiss();
+                        }
+                    }
+                });
+
+                const openLink = el('a', 'open-link', 'Open ↗');
                 openLink.setAttribute('data-role', 'open-link');
+                openLink.title = 'Open in Raindrop';
                 const cid = getBookmarkCollectionId(bookmark);
                 openLink.href = `${APP_BASE_URL}/my/${cid}/item/${encodeURIComponent(bookmark._id)}/edit`;
                 openLink.target = '_blank';
                 openLink.rel = 'noopener noreferrer';
 
                 footer.appendChild(favBtn);
+                footer.appendChild(deleteBtn);
                 footer.appendChild(openLink);
                 details.appendChild(footer);
             }
@@ -2040,7 +3653,7 @@
                         removeBtn.title = `Remove "${tag}"`;
 
                         removeBtn.addEventListener('click', async () => {
-                            if (!currentBookmark || !currentBookmark._id) return;
+                            if (isDeletingBookmark || !currentBookmark || !currentBookmark._id) return;
                             removeBtn.disabled = true;
                             pendingTagOps++;
                             clearDismissTimer();
@@ -2080,7 +3693,7 @@
                 };
 
                 const submitTagInput = async () => {
-                    if (!currentBookmark || !currentBookmark._id) return;
+                    if (isDeletingBookmark || !currentBookmark || !currentBookmark._id) return;
                     const parsed = parseTagInput(tagInput.value);
                     tagInput.value = '';
                     if (!parsed.length) return;
@@ -2179,14 +3792,68 @@
             scheduleAutoDismiss();
         }
 
+        function finishAutoScreenshot(bookmark, candidates) {
+            isCapturingScreenshot = false;
+            if (bookmark) {
+                currentBookmark = bookmark;
+            }
+            if (Array.isArray(candidates)) {
+                currentCandidates = candidates;
+            }
+            if (returnView && (returnView.type === 'saved' || returnView.type === 'existing')) {
+                returnView.bookmark = currentBookmark;
+                returnView.candidates = currentCandidates;
+                returnView.capturingScreenshot = false;
+            }
+            if (minimizedView && (minimizedView.type === 'saved' || minimizedView.type === 'existing' || minimizedView.type === 'picker')) {
+                minimizedView.bookmark = currentBookmark;
+                minimizedView.candidates = currentCandidates;
+                if (minimizedView.type !== 'picker') {
+                    minimizedView.capturingScreenshot = false;
+                }
+            }
+
+            if (activeScreen === 'saved' && activeThumbBtn) {
+                renderThumbButtonContent(activeThumbBtn, currentBookmark, false);
+                scheduleAutoDismiss();
+            } else if (activeScreen === 'picker' && !isUpdatingThumb) {
+                showPicker(currentBookmark, currentCandidates);
+            }
+        }
+
+        function createCaptureTileIcon() {
+            const svg = document.createElementNS(SVG_NS, 'svg');
+            svg.setAttribute('viewBox', '0 0 24 24');
+            svg.setAttribute('fill', 'none');
+            svg.setAttribute('stroke', 'currentColor');
+            svg.setAttribute('stroke-width', '2');
+            svg.setAttribute('stroke-linecap', 'round');
+            svg.setAttribute('stroke-linejoin', 'round');
+            svg.setAttribute('class', 'capture-tile-icon');
+            svg.setAttribute('aria-hidden', 'true');
+
+            const path = document.createElementNS(SVG_NS, 'path');
+            path.setAttribute('d', 'M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z');
+            const circle = document.createElementNS(SVG_NS, 'circle');
+            circle.setAttribute('cx', '12');
+            circle.setAttribute('cy', '13');
+            circle.setAttribute('r', '4');
+
+            svg.appendChild(path);
+            svg.appendChild(circle);
+            return svg;
+        }
+
         function showPicker(bookmark, candidates, pickerErrorMsg = '') {
             currentBookmark = bookmark;
             currentCandidates = Array.isArray(candidates) ? candidates : [];
+            currentPickerErrorMsg = pickerErrorMsg || '';
             pickerOpened = true;
             autoHideCancelledPermanently = true;
             clearDismissTimer();
 
             const card = buildCard('picker');
+            const pickerEpoch = renderEpoch;
 
             const header = el('div', 'header');
             const left = el('div', 'header-left');
@@ -2199,7 +3866,9 @@
             backBtn.addEventListener('click', () => {
                 showSaved(currentBookmark, {
                     existing: currentWasExisting,
-                    candidates: currentCandidates
+                    candidates: currentCandidates,
+                    capturingScreenshot: isCapturingScreenshot,
+                    preserveAutoHide: true
                 });
             });
 
@@ -2215,69 +3884,196 @@
             const body = el('div', 'body');
 
             if (!currentCandidates.length) {
-                body.appendChild(el('p', 'muted', 'No candidate thumbnails found on this page.'));
-            } else {
-                const grid = el('div', 'grid-wrap');
-                grid.setAttribute('data-role', 'thumb-grid');
-                const optionButtons = [];
+                body.appendChild(el('p', 'picker-hint', 'No candidate thumbnails found on this page.'));
+            }
 
-                for (const link of currentCandidates) {
-                    const optionBtn = el('button', 'thumb-option');
-                    optionBtn.type = 'button';
-                    optionBtn.setAttribute('data-role', 'thumb-option');
-                    optionBtn.setAttribute('data-link', link);
-                    const isSelected = Boolean(currentBookmark && currentBookmark.cover === link);
-                    optionBtn.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
-                    optionBtn.title = link;
+            const grid = el('div', 'grid-wrap');
+            grid.setAttribute('data-role', 'thumb-grid');
+            const optionButtons = [];
+            const blockButtons = [];
 
-                    const img = el('img');
-                    img.alt = '';
-                    attachImageWithFallback(img, link, currentBookmark && currentBookmark.link, () => {
-                        img.remove();
-                        optionBtn.appendChild(el('span', 'thumb-placeholder', 'Broken'));
-                    });
-                    optionBtn.appendChild(img);
+            const lockGridWithSpinner = (targetBtn) => {
+                for (const btn of optionButtons) {
+                    btn.disabled = true;
+                }
+                for (const btn of blockButtons) {
+                    btn.disabled = true;
+                }
+                const spinnerWrap = el('div', 'tile-spinner');
+                spinnerWrap.appendChild(el('span', 'spinner'));
+                targetBtn.appendChild(spinnerWrap);
+            };
 
-                    optionBtn.addEventListener('click', async () => {
+            for (const link of currentCandidates) {
+                const tileWrap = el('div', 'thumb-tile');
+                const optionBtn = el('button', 'thumb-option');
+                optionBtn.type = 'button';
+                optionBtn.setAttribute('data-role', 'thumb-option');
+                optionBtn.setAttribute('data-link', link);
+                const isSelected = Boolean(currentBookmark && currentBookmark.cover === link);
+                optionBtn.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+                optionBtn.title = link;
+
+                const img = el('img');
+                img.alt = '';
+                attachImageWithFallback(img, link, currentBookmark && currentBookmark.link, () => {
+                    img.remove();
+                    optionBtn.appendChild(el('span', 'thumb-placeholder', 'Broken'));
+                });
+                optionBtn.appendChild(img);
+
+                optionBtn.addEventListener('click', async () => {
+                    if (isUpdatingThumb) return;
+                    isUpdatingThumb = true;
+                    lockGridWithSpinner(optionBtn);
+
+                    try {
+                        const updated = await callbacks.onSelectThumbnail(currentBookmark, link);
+                        if (pickerEpoch !== renderEpoch) return;
+                        currentBookmark = updated || currentBookmark;
+                        const refreshedCandidates = typeof callbacks.getCandidates === 'function'
+                            ? callbacks.getCandidates(currentBookmark)
+                            : currentCandidates;
+                        showSaved(currentBookmark, {
+                            existing: currentWasExisting,
+                            candidates: refreshedCandidates,
+                            preserveAutoHide: true
+                        });
+                    } catch (err) {
+                        logError('Failed to update thumbnail', {
+                            url: currentBookmark && currentBookmark.link,
+                            bookmarkId: currentBookmark && currentBookmark._id,
+                            candidateLink: link,
+                            error: err
+                        });
+                        if (pickerEpoch !== renderEpoch) return;
+                        isUpdatingThumb = false;
+                        showPicker(
+                            currentBookmark,
+                            currentCandidates,
+                            (err && err.message) || 'Failed to update thumbnail'
+                        );
+                    }
+                });
+
+                optionButtons.push(optionBtn);
+                tileWrap.appendChild(optionBtn);
+
+                if (link !== '<screenshot>' && typeof callbacks.onBlockThumbnail === 'function') {
+                    const blockBtn = el('button', 'thumb-block-btn', 'Block');
+                    blockBtn.type = 'button';
+                    blockBtn.setAttribute('data-role', 'thumb-block-btn');
+                    blockBtn.setAttribute('data-link', link);
+                    blockBtn.setAttribute('aria-label', `Block thumbnail ${link}`);
+                    blockBtn.title = 'Block this image URL from being picked as thumbnail';
+
+                    blockBtn.addEventListener('click', async (e) => {
+                        if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+                        if (e && typeof e.preventDefault === 'function') e.preventDefault();
                         if (isUpdatingThumb) return;
                         isUpdatingThumb = true;
-
-                        for (const btn of optionButtons) {
-                            btn.disabled = true;
-                        }
-                        const spinnerWrap = el('div', 'tile-spinner');
-                        spinnerWrap.appendChild(el('span', 'spinner'));
-                        optionBtn.appendChild(spinnerWrap);
+                        lockGridWithSpinner(optionBtn);
 
                         try {
-                            const updated = await callbacks.onSelectThumbnail(currentBookmark, link);
-                            currentBookmark = updated || currentBookmark;
-                            showSaved(currentBookmark, {
-                                existing: currentWasExisting,
-                                candidates: currentCandidates
-                            });
+                            const result = await callbacks.onBlockThumbnail(currentBookmark, link);
+                            if (pickerEpoch !== renderEpoch) return;
+                            if (result && result.bookmark) {
+                                currentBookmark = result.bookmark;
+                            }
+                            const refreshedCandidates = (result && Array.isArray(result.candidates))
+                                ? result.candidates
+                                : (typeof callbacks.getCandidates === 'function'
+                                    ? callbacks.getCandidates(currentBookmark)
+                                    : currentCandidates.filter((c) => c !== link));
+
+                            if (returnView && (returnView.type === 'saved' || returnView.type === 'existing')) {
+                                returnView.bookmark = currentBookmark;
+                                returnView.candidates = refreshedCandidates;
+                            }
+
+                            if (result && result.tookScreenshot) {
+                                isCapturingScreenshot = false;
+                                showSaved(currentBookmark, {
+                                    existing: currentWasExisting,
+                                    candidates: refreshedCandidates,
+                                    preserveAutoHide: true
+                                });
+                                return;
+                            }
+
+                            isUpdatingThumb = false;
+                            showPicker(currentBookmark, refreshedCandidates);
                         } catch (err) {
-                            logError('Failed to update thumbnail', {
+                            logError('Failed to block thumbnail', {
                                 url: currentBookmark && currentBookmark.link,
                                 bookmarkId: currentBookmark && currentBookmark._id,
                                 candidateLink: link,
                                 error: err
                             });
+                            if (pickerEpoch !== renderEpoch) return;
                             isUpdatingThumb = false;
+                            const refreshedCandidates = typeof callbacks.getCandidates === 'function'
+                                ? callbacks.getCandidates(currentBookmark)
+                                : currentCandidates.filter((c) => c !== link);
                             showPicker(
                                 currentBookmark,
-                                currentCandidates,
-                                (err && err.message) || 'Failed to update thumbnail'
+                                refreshedCandidates,
+                                (err && err.message) || 'Failed to block thumbnail'
                             );
                         }
                     });
 
-                    optionButtons.push(optionBtn);
-                    grid.appendChild(optionBtn);
+                    blockButtons.push(blockBtn);
+                    tileWrap.appendChild(blockBtn);
                 }
 
-                body.appendChild(grid);
+                grid.appendChild(tileWrap);
             }
+
+            const captureBtn = el('button', 'thumb-option capture-tile');
+            captureBtn.type = 'button';
+            captureBtn.setAttribute('data-role', 'capture-screenshot-btn');
+            captureBtn.title = 'Capture page screenshot';
+            captureBtn.appendChild(createCaptureTileIcon());
+            captureBtn.appendChild(el('span', '', 'Screenshot'));
+
+            captureBtn.addEventListener('click', async () => {
+                if (isUpdatingThumb) return;
+                isUpdatingThumb = true;
+                lockGridWithSpinner(captureBtn);
+
+                try {
+                    const updated = await callbacks.onCaptureScreenshot(currentBookmark);
+                    if (pickerEpoch !== renderEpoch) return;
+                    currentBookmark = updated || currentBookmark;
+                    isCapturingScreenshot = false;
+                    const refreshedCandidates = typeof callbacks.getCandidates === 'function'
+                        ? callbacks.getCandidates(currentBookmark)
+                        : currentCandidates;
+                    showSaved(currentBookmark, {
+                        existing: currentWasExisting,
+                        candidates: refreshedCandidates,
+                        preserveAutoHide: true
+                    });
+                } catch (err) {
+                    logError('Failed to capture screenshot thumbnail', {
+                        url: currentBookmark && currentBookmark.link,
+                        bookmarkId: currentBookmark && currentBookmark._id,
+                        error: err
+                    });
+                    if (pickerEpoch !== renderEpoch) return;
+                    isUpdatingThumb = false;
+                    showPicker(
+                        currentBookmark,
+                        currentCandidates,
+                        (err && err.message) || 'Failed to capture screenshot'
+                    );
+                }
+            });
+
+            optionButtons.push(captureBtn);
+            grid.appendChild(captureBtn);
+            body.appendChild(grid);
 
             if (pickerErrorMsg) {
                 const errEl = el('div', 'error-banner', pickerErrorMsg);
@@ -2352,6 +4148,11 @@
         function showSettings({ focusToken = false, feedback = '', feedbackKind = '' } = {}) {
             pickerOpened = false;
             clearDismissTimer();
+            currentSettingsOptions = {
+                focusToken: Boolean(focusToken),
+                feedback: feedback || '',
+                feedbackKind: feedbackKind || ''
+            };
 
             const wasErrorAuth = Boolean(returnView && returnView.type === 'error' && returnView.err && returnView.err.status === 401);
             const errorRetryUrl = returnView && returnView.type === 'error' ? returnView.url : '';
@@ -2493,6 +4294,22 @@
             excludesField.appendChild(excludesInput);
             form.appendChild(excludesField);
 
+            // 5. Blocked Thumbnail URL Patterns
+            const blockedThumbsField = el('div', 'field');
+            blockedThumbsField.appendChild(el('label', 'field-label', 'Blocked Thumbnail URL Patterns (one per line)'));
+            const blockedThumbsInput = el('textarea', 'field-textarea');
+            blockedThumbsInput.rows = 3;
+            blockedThumbsInput.placeholder = 'https://abs.twimg.com/.../default-og.jpg\n*://example.com/default-og*';
+            blockedThumbsInput.value = getBlockedThumbnails().join('\n');
+            blockedThumbsInput.setAttribute('data-role', 'setting-blocked-thumbnails');
+            blockedThumbsField.appendChild(blockedThumbsInput);
+            blockedThumbsField.appendChild(el(
+                'span',
+                'field-hint',
+                'Matching image URLs are skipped as thumbnails; takes a screenshot if no image remains. Supports * / ? wildcards, /regex/flags, or substring.'
+            ));
+            form.appendChild(blockedThumbsField);
+
             // Feedback area
             const feedbackEl = el('div', feedback ? (feedbackKind === 'error' ? 'error-banner' : 'success-banner') : '');
             feedbackEl.setAttribute('data-role', 'settings-feedback');
@@ -2532,7 +4349,8 @@
                     collectionId: colInput.value,
                     overlayTimeoutMs: timeoutInput.value,
                     spaDelayMs: spaInput.value,
-                    excludes: excludesInput.value
+                    excludes: excludesInput.value,
+                    blockedThumbnails: blockedThumbsInput.value
                 });
 
                 if (!result || !result.ok) {
@@ -2561,6 +4379,176 @@
             }
         }
 
+        function createDropletIcon() {
+            const svg = document.createElementNS(SVG_NS, 'svg');
+            svg.setAttribute('viewBox', '0 0 24 24');
+            svg.setAttribute('class', 'mini-icon');
+            svg.setAttribute('aria-hidden', 'true');
+
+            const drop = document.createElementNS(SVG_NS, 'path');
+            drop.setAttribute('fill', 'currentColor');
+            drop.setAttribute('d', 'M12 2.5C12 2.5 5.5 10.1 5.5 14.5a6.5 6.5 0 0 0 13 0c0-4.4-6.5-12-6.5-12z');
+
+            const highlight = document.createElementNS(SVG_NS, 'path');
+            highlight.setAttribute('fill', 'none');
+            highlight.setAttribute('stroke', '#ffffff');
+            highlight.setAttribute('stroke-width', '1.6');
+            highlight.setAttribute('stroke-linecap', 'round');
+            highlight.setAttribute('opacity', '0.75');
+            highlight.setAttribute('d', 'M9.2 14.4a2.9 2.9 0 0 0 2.6 2.9');
+
+            svg.appendChild(drop);
+            svg.appendChild(highlight);
+            return svg;
+        }
+
+        function createCloseIcon() {
+            const svg = document.createElementNS(SVG_NS, 'svg');
+            svg.setAttribute('viewBox', '0 0 24 24');
+            svg.setAttribute('fill', 'none');
+            svg.setAttribute('stroke', 'currentColor');
+            svg.setAttribute('stroke-width', '2.2');
+            svg.setAttribute('stroke-linecap', 'round');
+            svg.setAttribute('class', 'mini-icon');
+            svg.setAttribute('aria-hidden', 'true');
+
+            const line1 = document.createElementNS(SVG_NS, 'line');
+            line1.setAttribute('x1', '6');
+            line1.setAttribute('y1', '6');
+            line1.setAttribute('x2', '18');
+            line1.setAttribute('y2', '18');
+
+            const line2 = document.createElementNS(SVG_NS, 'line');
+            line2.setAttribute('x1', '18');
+            line2.setAttribute('y1', '6');
+            line2.setAttribute('x2', '6');
+            line2.setAttribute('y2', '18');
+
+            svg.appendChild(line1);
+            svg.appendChild(line2);
+            return svg;
+        }
+
+        function captureCurrentViewSnapshot() {
+            if (activeScreen === 'saved' || activeScreen === 'existing') {
+                return {
+                    type: activeScreen,
+                    bookmark: currentBookmark,
+                    candidates: currentCandidates,
+                    capturingScreenshot: isCapturingScreenshot
+                };
+            }
+            if (activeScreen === 'picker') {
+                return {
+                    type: 'picker',
+                    bookmark: currentBookmark,
+                    candidates: currentCandidates,
+                    pickerErrorMsg: currentPickerErrorMsg
+                };
+            }
+            if (activeScreen === 'settings') {
+                return {
+                    type: 'settings',
+                    settingsOptions: currentSettingsOptions || {}
+                };
+            }
+            if (activeScreen === 'error') {
+                return {
+                    type: 'error',
+                    err: returnView && returnView.type === 'error' ? returnView.err : null,
+                    url: returnView && returnView.type === 'error' ? returnView.url : ''
+                };
+            }
+            return null;
+        }
+
+        function minimize() {
+            if (activeScreen === 'minimized') return;
+            const snapshot = captureCurrentViewSnapshot();
+            if (!snapshot) {
+                hide();
+                return;
+            }
+
+            clearDismissTimer();
+            pickerOpened = false;
+            isHovered = false;
+            isTagInputFocused = false;
+            isUpdatingThumb = false;
+            isUpdatingFavorite = false;
+            isDeletingBookmark = false;
+            activeThumbBtn = null;
+            pendingTagOps = 0;
+            renderEpoch++;
+            minimizedView = snapshot;
+            activeScreen = 'minimized';
+
+            ensureMounted();
+            clearRoot();
+
+            const bar = el('div', 'mini-bar');
+            bar.setAttribute('data-screen', 'minimized');
+            bar.setAttribute('data-role', 'mini-bar');
+
+            const showBtn = el('button', 'mini-btn mini-show-btn');
+            showBtn.type = 'button';
+            showBtn.setAttribute('data-role', 'show-overlay-btn');
+            showBtn.setAttribute('aria-label', 'Show Raindrop overlay');
+            showBtn.title = 'Show Raindrop overlay';
+            showBtn.appendChild(createDropletIcon());
+            showBtn.addEventListener('click', () => restoreMinimized());
+
+            const removeBtn = el('button', 'mini-btn mini-remove-btn');
+            removeBtn.type = 'button';
+            removeBtn.setAttribute('data-role', 'remove-overlay-btn');
+            removeBtn.setAttribute('aria-label', 'Remove overlay from page');
+            removeBtn.title = 'Remove overlay from page';
+            removeBtn.appendChild(createCloseIcon());
+            removeBtn.addEventListener('click', () => hide());
+
+            bar.appendChild(showBtn);
+            bar.appendChild(removeBtn);
+            rootEl.appendChild(bar);
+        }
+
+        function restoreMinimized() {
+            if (activeScreen !== 'minimized' || !minimizedView) return;
+            const target = minimizedView;
+            minimizedView = null;
+            autoHideCancelledPermanently = true;
+            clearDismissTimer();
+
+            if (target.type === 'saved' || target.type === 'existing') {
+                const latestCandidates = typeof callbacks.getCandidates === 'function'
+                    ? callbacks.getCandidates(target.bookmark)
+                    : target.candidates;
+                showSaved(target.bookmark, {
+                    existing: target.type === 'existing',
+                    candidates: latestCandidates,
+                    forceRender: true,
+                    capturingScreenshot: isCapturingScreenshot,
+                    preserveAutoHide: true
+                });
+                return;
+            }
+            if (target.type === 'picker') {
+                const latestCandidates = typeof callbacks.getCandidates === 'function'
+                    ? callbacks.getCandidates(target.bookmark)
+                    : target.candidates;
+                showPicker(target.bookmark, latestCandidates, target.pickerErrorMsg || '');
+                return;
+            }
+            if (target.type === 'settings') {
+                showSettings(target.settingsOptions || {});
+                return;
+            }
+            if (target.type === 'error') {
+                showError(target.err, target.url);
+                return;
+            }
+            hide();
+        }
+
         function hide() {
             clearDismissTimer();
             pickerOpened = false;
@@ -2569,9 +4557,15 @@
             isTagInputFocused = false;
             isUpdatingThumb = false;
             isUpdatingFavorite = false;
+            isDeletingBookmark = false;
+            isCapturingScreenshot = false;
+            activeThumbBtn = null;
             pendingTagOps = 0;
             renderEpoch++;
             activeScreen = 'idle';
+            minimizedView = null;
+            currentPickerErrorMsg = '';
+            currentSettingsOptions = null;
             returnView = { type: 'none' };
             clearRoot();
             if (host && host.parentNode) {
@@ -2587,6 +4581,8 @@
             return {
                 activeScreen,
                 pickerOpened,
+                canRestore: Boolean(minimizedView),
+                minimizedViewType: minimizedView ? minimizedView.type : null,
                 bookmark: currentBookmark,
                 candidates: currentCandidates,
                 shadowRoot: shadow,
@@ -2598,10 +4594,14 @@
             showSaving,
             showNotice,
             showSaved,
+            finishAutoScreenshot,
             showPicker,
             showError,
             showSettings,
+            minimize,
+            restore: restoreMinimized,
             hide,
+            handleVisibilityChange,
             getState
         };
     }
@@ -2612,6 +4612,7 @@
     const attemptedUrls = new Set();
     const savedBookmarksByUrl = new Map();
     const bookmarksById = new Map();
+    const deletedBookmarkIds = new Set();
     const scrapedMetaByUrl = new Map();
     const inFlightPromises = new Map();
     const bookmarkUpdateQueues = new Map();
@@ -2634,6 +4635,22 @@
         }
     }
 
+    function evictCachedBookmark(bookmark) {
+        if (!bookmark) return;
+        const bookmarkId = bookmark._id;
+        if (bookmarkId !== undefined && bookmarkId !== null) {
+            bookmarksById.delete(bookmarkId);
+            for (const [cachedUrl, cachedItem] of savedBookmarksByUrl.entries()) {
+                if (cachedItem && cachedItem._id === bookmarkId) {
+                    savedBookmarksByUrl.delete(cachedUrl);
+                }
+            }
+        }
+        if (bookmark.link && savedBookmarksByUrl.get(bookmark.link) === bookmark) {
+            savedBookmarksByUrl.delete(bookmark.link);
+        }
+    }
+
     function getLatestCachedBookmark(bookmark) {
         if (!bookmark) return bookmark;
         if (bookmark._id !== undefined && bookmark._id !== null && bookmarksById.has(bookmark._id)) {
@@ -2648,6 +4665,11 @@
     let sessionUserCollectionId = null;
     let sessionCollectionResolved = false;
     let pendingSaveTimer = null;
+    let pendingSaveUrl = null;
+    let pendingSaveDueAt = 0;
+    let initialSaveTriggered = false;
+    let domObserverAttached = false;
+    let domReadyListenerCleanup = null;
     let lastObservedUrl = typeof location !== 'undefined' ? location.href : '';
     let uiEpoch = 0;
 
@@ -2674,13 +4696,21 @@
             return { ok: false, error: 'Invalid SPA delay. Enter a non-negative integer in ms.' };
         }
 
-        const nextExcludes = String(values.excludes || '')
-            .split(/\r?\n/)
-            .map((line) => line.trim())
-            .filter(Boolean);
+        const nextExcludes = normalizePatternList(values.excludes);
         for (const pattern of nextExcludes) {
             if (!compileExcludeMatcher(pattern)) {
                 return { ok: false, error: `Invalid exclude pattern: ${pattern}` };
+            }
+        }
+
+        const hasBlockedThumbnailsField = Object.prototype.hasOwnProperty.call(values, 'blockedThumbnails');
+        let nextBlockedThumbnails;
+        if (hasBlockedThumbnailsField) {
+            nextBlockedThumbnails = normalizePatternList(values.blockedThumbnails, { deduplicate: true });
+            for (const pattern of nextBlockedThumbnails) {
+                if (!compileUrlPatternMatcher(pattern, 'blocked thumbnail')) {
+                    return { ok: false, error: `Invalid blocked thumbnail pattern: ${pattern}` };
+                }
             }
         }
 
@@ -2711,6 +4741,9 @@
         gmSet(STORAGE_KEYS.overlayTimeoutMs, nextTimeout);
         gmSet(STORAGE_KEYS.spaDelayMs, nextSpaDelay);
         gmSet(STORAGE_KEYS.excludes, nextExcludes);
+        if (hasBlockedThumbnailsField) {
+            gmSet(STORAGE_KEYS.blockedThumbnails, nextBlockedThumbnails);
+        }
 
         if (!nextEnabled) {
             cancelPendingSave();
@@ -2722,7 +4755,10 @@
                 collectionId: nextCollection,
                 overlayTimeoutMs: nextTimeout,
                 spaDelayMs: nextSpaDelay,
-                excludeCount: nextExcludes.length
+                excludeCount: nextExcludes.length,
+                blockedThumbnailCount: hasBlockedThumbnailsField
+                    ? nextBlockedThumbnails.length
+                    : getBlockedThumbnails().length
             });
         }
 
@@ -2741,8 +4777,22 @@
         async onSelectThumbnail(bookmark, link) {
             return selectThumbnail(bookmark, link);
         },
+        async onBlockThumbnail(bookmark, link) {
+            return blockThumbnailUrl(bookmark, link);
+        },
+        async onCaptureScreenshot(bookmark) {
+            const targetUrl = (bookmark && bookmark.link) || (typeof location !== 'undefined' ? location.href : '');
+            return captureAndSaveScreenshot(bookmark, targetUrl, {
+                allowClientCapture: typeof location === 'undefined' || !targetUrl || location.href === targetUrl
+            });
+        },
         async onToggleFavorite(bookmark) {
             return toggleFavorite(bookmark);
+        },
+        async onDeleteBookmark(bookmark) {
+            const res = await deleteBookmark(bookmark);
+            uiEpoch++;
+            return res;
         },
         async onAddTags(bookmark, tags) {
             return addBookmarkTags(bookmark, tags);
@@ -2802,44 +4852,107 @@
         }
     }
 
-    async function enrichCreated(url, createdItem) {
+    async function enrichCreated(url, createdItem, options = {}) {
         if (!url || !createdItem || !createdItem._id) return createdItem;
+
+        const matchers = getBlockedThumbnailMatchers();
+        const createdSanitized = sanitizeMediaAndCover(createdItem, matchers);
+        const changed = {};
+        let parsedBlockedCount = 0;
+
+        if (createdSanitized.mediaBlocked) {
+            changed.media = createdSanitized.media;
+        }
+        if (createdSanitized.coverBlocked) {
+            changed.cover = createdSanitized.cover;
+        }
 
         try {
             const parse = await apiRequest('GET', `import/url/parse?url=${encodeURIComponent(url)}`);
-            if (!parse || parse.error || !parse.item) return createdItem;
-
-            const changed = {};
-            if (parse.item.media && parse.item.media.length) {
-                if (!createdItem.media || !createdItem.media.length) {
-                    changed.media = parse.item.media;
+            if (parse && !parse.error && parse.item) {
+                const parsedSanitized = sanitizeMediaAndCover(parse.item, matchers);
+                parsedBlockedCount = parsedSanitized.blockedCount;
+                if (parsedBlockedCount > 0) {
+                    logDebug('Filtered blocked thumbnails from import/url/parse', {
+                        url,
+                        bookmarkId: createdItem._id,
+                        blockedCount: parsedBlockedCount
+                    });
                 }
-                if (!createdItem.cover) {
-                    changed.cover = parse.item.media[0].link;
+
+                const effectiveMedia = changed.media !== undefined
+                    ? changed.media
+                    : (Array.isArray(createdItem.media) ? createdItem.media : []);
+                const effectiveCover = changed.cover !== undefined
+                    ? changed.cover
+                    : (typeof createdItem.cover === 'string' ? createdItem.cover.trim() : '');
+
+                if (parsedSanitized.media.length && !effectiveMedia.length) {
+                    changed.media = parsedSanitized.media;
+                }
+                if (!effectiveCover && parsedSanitized.cover) {
+                    changed.cover = parsedSanitized.cover;
+                }
+
+                if (parse.item.type && (!createdItem.type || (createdItem.type === 'link' && parse.item.type !== 'link'))) {
+                    changed.type = parse.item.type;
+                }
+                if (!createdItem.excerpt && parse.item.excerpt) {
+                    changed.excerpt = String(parse.item.excerpt).slice(0, 10000);
                 }
             }
-
-            if (parse.item.type && (!createdItem.type || (createdItem.type === 'link' && parse.item.type !== 'link'))) {
-                changed.type = parse.item.type;
-            }
-
-            if (!Object.keys(changed).length) {
-                return createdItem;
-            }
-
-            logDebug('Enriching created bookmark via PUT', { url, bookmarkId: createdItem._id, fields: Object.keys(changed) });
-            const updateRes = await apiRequest('PUT', `raindrop/${createdItem._id}`, changed);
-            return {
-                ...createdItem,
-                ...changed,
-                ...(updateRes && updateRes.item ? updateRes.item : {})
-            };
         } catch (e) {
             logWarn('Post-create metadata enrichment failed (non-fatal)', {
                 url,
                 bookmarkId: createdItem._id,
                 error: e
             });
+        }
+
+        const finalEffectiveCover = changed.cover !== undefined
+            ? changed.cover
+            : (createdSanitized.coverBlocked ? '' : createdItem.cover);
+
+        if (
+            createdSanitized.blockedCount > 0
+            || parsedBlockedCount > 0
+            || (options.sentPleaseParse && !finalEffectiveCover)
+        ) {
+            changed.pleaseParse = null;
+        }
+
+        if (!Object.keys(changed).length) {
+            return createdItem;
+        }
+
+        try {
+            logDebug('Enriching created bookmark via PUT', { url, bookmarkId: createdItem._id, fields: Object.keys(changed) });
+            const updateRes = await apiRequest('PUT', `raindrop/${createdItem._id}`, changed);
+            const merged = {
+                ...createdItem,
+                ...changed,
+                ...(updateRes && updateRes.item ? updateRes.item : {})
+            };
+            if (changed.cover === '' && isThumbnailBlocked(merged.cover, matchers)) {
+                merged.cover = '';
+            }
+            if (Array.isArray(changed.media) && !changed.media.length && Array.isArray(merged.media)) {
+                const hasOnlyBlocked = merged.media.every((m) => !m || !m.link || isThumbnailBlocked(m.link, matchers));
+                if (hasOnlyBlocked) merged.media = [];
+            }
+            return merged;
+        } catch (e) {
+            logWarn('Post-create metadata update failed (non-fatal)', {
+                url,
+                bookmarkId: createdItem._id,
+                error: e
+            });
+            if (createdSanitized.blockedCount > 0) {
+                return {
+                    ...createdItem,
+                    ...changed
+                };
+            }
             return createdItem;
         }
     }
@@ -2850,16 +4963,30 @@
         }
 
         const bookmarkId = bookmark._id;
+        if (deletedBookmarkIds.has(bookmarkId)) {
+            return Promise.reject(new Error('Bookmark was deleted.'));
+        }
         const prevQueue = bookmarkUpdateQueues.get(bookmarkId) || Promise.resolve();
 
         const nextOp = prevQueue.catch(() => {}).then(async () => {
+            if (deletedBookmarkIds.has(bookmarkId)) {
+                throw new Error('Bookmark was deleted.');
+            }
             const latest = getLatestCachedBookmark(bookmark);
-            const patch = buildPatch(latest);
-            if (!patch || !patch.payload) {
+            const patch = await buildPatch(latest);
+            if (!patch || (!patch.payload && typeof patch.send !== 'function')) {
                 return latest;
             }
+            if (deletedBookmarkIds.has(bookmarkId)) {
+                throw new Error('Bookmark was deleted.');
+            }
 
-            const res = await apiRequest('PUT', `raindrop/${bookmarkId}`, patch.payload);
+            const res = typeof patch.send === 'function'
+                ? await patch.send(latest)
+                : await apiRequest('PUT', `raindrop/${bookmarkId}`, patch.payload);
+            if (deletedBookmarkIds.has(bookmarkId)) {
+                throw new Error('Bookmark was deleted.');
+            }
             const serverItem = res && res.item ? res.item : {};
             const updated = {
                 ...latest,
@@ -2887,9 +5014,86 @@
         return nextOp;
     }
 
-    function selectThumbnail(bookmark, link) {
+    function uploadBookmarkCover(bookmark, blobOrFile, filename = 'screenshot.jpg') {
+        if (!blobOrFile) {
+            return Promise.reject(new Error('No screenshot image provided.'));
+        }
+        if (typeof FormData === 'undefined') {
+            return Promise.reject(new Error('FormData unavailable for cover upload.'));
+        }
+
         return enqueueBookmarkMutation(bookmark, (latest) => {
-            const currentMedia = Array.isArray(latest.media) ? latest.media : [];
+            const formData = new FormData();
+            if (typeof File !== 'undefined' && blobOrFile instanceof File) {
+                formData.append('cover', blobOrFile);
+            } else {
+                formData.append('cover', blobOrFile, filename);
+            }
+
+            return {
+                send: () => apiRequest('PUT', `raindrop/${latest._id}/cover`, formData, {
+                    timeout: Math.max(API_TIMEOUT, 60000)
+                }),
+                finalize: (_updated, serverItem) => ({
+                    cover: serverItem.cover || latest.cover,
+                    media: Array.isArray(serverItem.media) && serverItem.media.length
+                        ? serverItem.media
+                        : latest.media
+                })
+            };
+        });
+    }
+
+    async function captureAndSaveScreenshot(bookmark, targetUrl, options = {}) {
+        if (!bookmark || !bookmark._id) {
+            throw new Error('Cannot attach screenshot before bookmark is saved.');
+        }
+
+        const allowClientCapture = options.allowClientCapture !== false;
+        const samePage = typeof location === 'undefined' || !targetUrl || location.href === targetUrl;
+
+        if (allowClientCapture && samePage) {
+            const captured = await captureSimpleViewportScreenshot();
+            if (captured && captured.blob) {
+                try {
+                    logDebug('Uploading viewport page screenshot cover', {
+                        url: targetUrl || bookmark.link,
+                        bookmarkId: bookmark._id,
+                        method: captured.method,
+                        width: captured.width,
+                        height: captured.height,
+                        sizeBytes: captured.blob.size
+                    });
+                    return await uploadBookmarkCover(bookmark, captured.blob, 'screenshot.jpg');
+                } catch (err) {
+                    if (err && err.status === 401) {
+                        throw err;
+                    }
+                    logWarn('Cover upload failed; falling back to Raindrop <screenshot>', {
+                        url: targetUrl || bookmark.link,
+                        bookmarkId: bookmark._id,
+                        error: err
+                    });
+                }
+            }
+        }
+
+        logDebug('Applying Raindrop server <screenshot> fallback', {
+            url: targetUrl || bookmark.link,
+            bookmarkId: bookmark._id
+        });
+        return selectThumbnail(bookmark, '<screenshot>', {
+            stripBlocked: Boolean(options.stripBlocked)
+        });
+    }
+
+    function selectThumbnail(bookmark, link, options = {}) {
+        return enqueueBookmarkMutation(bookmark, (latest) => {
+            const matchers = options.stripBlocked ? getBlockedThumbnailMatchers() : null;
+            const rawMedia = Array.isArray(latest.media) ? latest.media : [];
+            const currentMedia = matchers
+                ? rawMedia.filter((m) => m && m.link && !isThumbnailBlocked(m.link, matchers))
+                : rawMedia;
             const nextMedia = currentMedia.some((m) => m && m.link === link)
                 ? currentMedia
                 : [...currentMedia, { link }];
@@ -2905,6 +5109,153 @@
                 })
             };
         });
+    }
+
+    async function reconcileBookmarkBlockedThumbnails(bookmark, targetUrl, options = {}) {
+        const matchers = getBlockedThumbnailMatchers();
+        const latest = getLatestCachedBookmark(bookmark);
+        const cachedMeta = targetUrl ? scrapedMetaByUrl.get(targetUrl) : null;
+
+        if (cachedMeta) {
+            const sanitizedMeta = sanitizeMediaAndCover(cachedMeta, matchers);
+            if (sanitizedMeta.blockedCount > 0) {
+                const nextMeta = { ...cachedMeta };
+                if (sanitizedMeta.cover) nextMeta.cover = sanitizedMeta.cover;
+                else delete nextMeta.cover;
+                if (sanitizedMeta.media.length) nextMeta.media = sanitizedMeta.media;
+                else delete nextMeta.media;
+                scrapedMetaByUrl.set(targetUrl, nextMeta);
+            }
+        }
+
+        const latestSanitized = sanitizeMediaAndCover(latest, matchers);
+        const candidatesAfter = buildCandidateImages(latest, targetUrl ? scrapedMetaByUrl.get(targetUrl) : null);
+        const remainingImages = candidatesAfter.filter((c) => c && c !== '<screenshot>');
+
+        const currentCover = String((latest && latest.cover) || '').trim();
+        const coverBlockedNow = Boolean(currentCover && isThumbnailBlocked(currentCover, matchers));
+        const shouldReplaceCover = coverBlockedNow
+            || (Boolean(options.forceReplaceEmptyCover) && !currentCover && remainingImages.length === 0);
+
+        let updatedBookmark = latest;
+        let needsScreenshot = false;
+
+        if (latest && latest._id) {
+            if (shouldReplaceCover) {
+                if (remainingImages.length > 0) {
+                    const nextCover = remainingImages[0];
+                    updatedBookmark = await enqueueBookmarkMutation(latest, (cur) => {
+                        const curSanitized = sanitizeMediaAndCover(cur, matchers);
+                        const nextMedia = curSanitized.media.some((m) => m && m.link === nextCover)
+                            ? curSanitized.media
+                            : [...curSanitized.media, { link: nextCover }];
+                        return {
+                            payload: { cover: nextCover, media: nextMedia, pleaseParse: null },
+                            fallback: { cover: nextCover, media: nextMedia },
+                            finalize: (_u, serverItem) => ({
+                                cover: (serverItem.cover && !isThumbnailBlocked(serverItem.cover, matchers))
+                                    ? serverItem.cover
+                                    : nextCover,
+                                media: Array.isArray(serverItem.media)
+                                    ? serverItem.media.filter((m) => m && m.link && !isThumbnailBlocked(m.link, matchers))
+                                    : nextMedia
+                            })
+                        };
+                    });
+                } else {
+                    if (coverBlockedNow || latestSanitized.mediaBlocked) {
+                        updatedBookmark = await enqueueBookmarkMutation(latest, (cur) => {
+                            const curSanitized = sanitizeMediaAndCover(cur, matchers);
+                            return {
+                                payload: { cover: '', media: curSanitized.media, pleaseParse: null },
+                                fallback: { cover: '', media: curSanitized.media },
+                                finalize: (_u, serverItem) => ({
+                                    cover: (serverItem.cover && !isThumbnailBlocked(serverItem.cover, matchers))
+                                        ? serverItem.cover
+                                        : '',
+                                    media: Array.isArray(serverItem.media)
+                                        ? serverItem.media.filter((m) => m && m.link && !isThumbnailBlocked(m.link, matchers))
+                                        : curSanitized.media
+                                })
+                            };
+                        });
+                    }
+                    needsScreenshot = true;
+                }
+            } else if (latestSanitized.mediaBlocked) {
+                updatedBookmark = await enqueueBookmarkMutation(latest, (cur) => {
+                    const curSanitized = sanitizeMediaAndCover(cur, matchers);
+                    return {
+                        payload: { media: curSanitized.media, pleaseParse: null },
+                        fallback: { media: curSanitized.media },
+                        finalize: (_u, serverItem) => ({
+                            media: Array.isArray(serverItem.media)
+                                ? serverItem.media.filter((m) => m && m.link && !isThumbnailBlocked(m.link, matchers))
+                                : curSanitized.media
+                        })
+                    };
+                });
+            }
+        }
+
+        const finalCandidates = buildCandidateImages(
+            updatedBookmark,
+            targetUrl ? scrapedMetaByUrl.get(targetUrl) : null
+        );
+
+        return {
+            bookmark: updatedBookmark,
+            candidates: finalCandidates,
+            needsScreenshot,
+            replacedCover: shouldReplaceCover
+        };
+    }
+
+    async function blockThumbnailUrl(bookmark, linkToBlock, options = {}) {
+        const target = String(linkToBlock || '').trim();
+        if (!target || target === '<screenshot>') {
+            throw new Error('Cannot block this thumbnail.');
+        }
+
+        const added = addBlockedThumbnailPattern(target);
+        logDebug('Blocked thumbnail URL', {
+            url: bookmark && bookmark.link,
+            bookmarkId: bookmark && bookmark._id,
+            blockedUrl: target,
+            added
+        });
+
+        const latest = getLatestCachedBookmark(bookmark);
+        const targetUrl = (latest && latest.link) || (typeof location !== 'undefined' ? location.href : '');
+        const reconciled = await reconcileBookmarkBlockedThumbnails(latest, targetUrl, {
+            forceReplaceEmptyCover: true
+        });
+
+        let updatedBookmark = reconciled.bookmark;
+        let tookScreenshot = false;
+
+        if (reconciled.needsScreenshot && updatedBookmark && updatedBookmark._id) {
+            const allowClientCapture = options.allowClientCapture !== undefined
+                ? Boolean(options.allowClientCapture)
+                : (typeof location === 'undefined' || !targetUrl || location.href === targetUrl);
+            updatedBookmark = await captureAndSaveScreenshot(updatedBookmark, targetUrl, {
+                allowClientCapture,
+                stripBlocked: true
+            });
+            tookScreenshot = true;
+        }
+
+        const finalCandidates = buildCandidateImages(
+            updatedBookmark,
+            targetUrl ? scrapedMetaByUrl.get(targetUrl) : null
+        );
+
+        return {
+            bookmark: updatedBookmark,
+            candidates: finalCandidates,
+            tookScreenshot,
+            replacedCover: reconciled.replacedCover
+        };
     }
 
     function toggleFavorite(bookmark) {
@@ -2925,6 +5276,48 @@
                 })
             };
         });
+    }
+
+    function deleteBookmark(bookmark) {
+        if (!bookmark || !bookmark._id) {
+            return Promise.reject(new Error('Cannot delete bookmark before it is saved.'));
+        }
+
+        const bookmarkId = bookmark._id;
+        const prevQueue = bookmarkUpdateQueues.get(bookmarkId) || Promise.resolve();
+
+        const nextOp = prevQueue.catch(() => {}).then(async () => {
+            const latest = getLatestCachedBookmark(bookmark);
+            if (deletedBookmarkIds.has(bookmarkId)) {
+                evictCachedBookmark(latest);
+                return { result: true, deletedId: bookmarkId };
+            }
+
+            logDebug('Deleting bookmark', {
+                url: latest && latest.link,
+                bookmarkId
+            });
+
+            const res = await apiRequest('DELETE', `raindrop/${encodeURIComponent(bookmarkId)}`);
+            deletedBookmarkIds.add(bookmarkId);
+            evictCachedBookmark(latest);
+
+            return {
+                ...(res && typeof res === 'object' ? res : {}),
+                result: true,
+                deletedId: bookmarkId
+            };
+        });
+
+        bookmarkUpdateQueues.set(bookmarkId, nextOp);
+        const cleanup = () => {
+            if (bookmarkUpdateQueues.get(bookmarkId) === nextOp) {
+                bookmarkUpdateQueues.delete(bookmarkId);
+            }
+        };
+        nextOp.then(cleanup, cleanup);
+
+        return nextOp;
     }
 
     function addBookmarkTags(bookmark, tagsInput) {
@@ -2988,6 +5381,49 @@
         });
     }
 
+    async function attachAutoScreenshot(bookmark, url, meta, myEpoch) {
+        let finalItem = bookmark;
+        try {
+            const readyInfo = await waitForPageReadyForCapture(url);
+            if (bookmark._id !== undefined && bookmark._id !== null && deletedBookmarkIds.has(bookmark._id)) {
+                return finalItem;
+            }
+            const allowClientCapture = Boolean(readyInfo && readyInfo.ready)
+                && (typeof location === 'undefined' || location.href === url);
+            const latestItem = getLatestCachedBookmark(bookmark);
+
+            if (!hasBookmarkThumbnail(latestItem)) {
+                const updatedItem = await captureAndSaveScreenshot(latestItem, url, {
+                    allowClientCapture,
+                    stripBlocked: true
+                });
+                if (updatedItem && !(bookmark._id !== undefined && bookmark._id !== null && deletedBookmarkIds.has(bookmark._id))) {
+                    finalItem = updatedItem;
+                    cacheSavedBookmark(url, finalItem);
+                }
+            } else {
+                finalItem = latestItem;
+            }
+        } catch (screenshotErr) {
+            if (bookmark._id !== undefined && bookmark._id !== null && deletedBookmarkIds.has(bookmark._id)) {
+                return finalItem;
+            }
+            if (screenshotErr && screenshotErr.status === 401) {
+                throw screenshotErr;
+            }
+            logWarn('Auto-screenshot fallback failed (bookmark remains saved)', {
+                url,
+                bookmarkId: bookmark && bookmark._id,
+                error: screenshotErr
+            });
+        } finally {
+            if (myEpoch === uiEpoch && !(bookmark._id !== undefined && bookmark._id !== null && deletedBookmarkIds.has(bookmark._id))) {
+                overlay.finishAutoScreenshot(finalItem, buildCandidateImages(finalItem, meta));
+            }
+        }
+        return finalItem;
+    }
+
     function saveCurrentUrl(targetUrl = location.href, options = {}) {
         const force = Boolean(options.force);
         const manual = Boolean(options.manual);
@@ -3000,18 +5436,21 @@
             return inFlightPromises.get(url);
         }
 
-        if (!force && attemptedUrls.has(url)) {
-            return Promise.resolve(savedBookmarksByUrl.get(url) || null);
-        }
-
         if (manual && savedBookmarksByUrl.has(url)) {
             const cached = savedBookmarksByUrl.get(url);
-            overlay.showSaved(cached, {
-                existing: true,
-                forceRender: true,
-                candidates: buildCandidateImages(cached, scrapedMetaByUrl.get(url))
-            });
-            return Promise.resolve(cached);
+            if (!sanitizeMediaAndCover(cached).blockedCount) {
+                overlay.showSaved(cached, {
+                    existing: true,
+                    forceRender: true,
+                    candidates: buildCandidateImages(cached, scrapedMetaByUrl.get(url))
+                });
+                return Promise.resolve(cached);
+            }
+            attemptedUrls.delete(url);
+        }
+
+        if (!force && attemptedUrls.has(url)) {
+            return Promise.resolve(savedBookmarksByUrl.get(url) || null);
         }
 
         attemptedUrls.add(url);
@@ -3030,16 +5469,54 @@
 
                 if (ids.length > 0) {
                     const loadRes = await apiRequest('GET', `raindrop/${ids[0]}`);
-                    const existingItem = (loadRes && loadRes.item) || { _id: ids[0], link: url, ...meta };
+                    let existingItem = (loadRes && loadRes.item) || { _id: ids[0], link: url, ...meta };
+                    if (existingItem._id !== undefined && existingItem._id !== null) {
+                        deletedBookmarkIds.delete(existingItem._id);
+                    }
                     cacheSavedBookmark(url, existingItem);
+
+                    let needsExistingScreenshot = false;
+                    const existingSanitized = sanitizeMediaAndCover(existingItem);
+                    if (existingSanitized.blockedCount > 0) {
+                        logDebug('Stripping blocked thumbnails from existing bookmark on revisit', {
+                            url,
+                            bookmarkId: existingItem._id,
+                            blockedCount: existingSanitized.blockedCount
+                        });
+                        try {
+                            const reconciled = await reconcileBookmarkBlockedThumbnails(existingItem, url, {
+                                forceReplaceEmptyCover: Boolean(
+                                    existingSanitized.mediaBlocked && !String(existingItem.cover || '').trim()
+                                )
+                            });
+                            if (reconciled && reconciled.bookmark) {
+                                existingItem = reconciled.bookmark;
+                                cacheSavedBookmark(url, existingItem);
+                            }
+                            needsExistingScreenshot = Boolean(reconciled && reconciled.needsScreenshot);
+                        } catch (stripErr) {
+                            if (stripErr && stripErr.status === 401) throw stripErr;
+                            logWarn('Failed to strip blocked thumbnails from existing bookmark (non-fatal)', {
+                                url,
+                                bookmarkId: existingItem && existingItem._id,
+                                error: stripErr
+                            });
+                        }
+                    }
 
                     if (myEpoch === uiEpoch) {
                         overlay.showSaved(existingItem, {
                             existing: true,
-                            candidates: buildCandidateImages(existingItem, meta)
+                            candidates: buildCandidateImages(existingItem, meta),
+                            capturingScreenshot: needsExistingScreenshot
                         });
                     }
-                    return existingItem;
+
+                    if (!needsExistingScreenshot) {
+                        return existingItem;
+                    }
+
+                    return await attachAutoScreenshot(existingItem, url, meta, myEpoch);
                 }
 
                 // Step 2: Resolve collectionId (auto -> user.config or -1)
@@ -3052,17 +5529,37 @@
                     link: url
                 };
 
+                const hasBlockedPatterns = getBlockedThumbnails().length > 0;
+                let suppressServerParse = !item.cover && hasBlockedPatterns;
+
                 if (item.title) {
-                    item.pleaseParse = { weight: 1 };
+                    if (!suppressServerParse) {
+                        item.pleaseParse = { weight: 1 };
+                    }
                 } else {
                     const parsed = await apiRequest('GET', `import/url/parse?url=${encodeURIComponent(url)}`);
                     if (parsed && parsed.item) {
+                        const sanitizedParsed = sanitizeMediaAndCover(parsed.item);
+                        const parsedItem = { ...parsed.item };
+                        if (sanitizedParsed.blockedCount > 0) {
+                            logDebug('Filtered blocked thumbnails from pre-create parse', {
+                                url,
+                                blockedCount: sanitizedParsed.blockedCount
+                            });
+                            if (sanitizedParsed.cover) parsedItem.cover = sanitizedParsed.cover;
+                            else delete parsedItem.cover;
+                            if (sanitizedParsed.media.length) parsedItem.media = sanitizedParsed.media;
+                            else delete parsedItem.media;
+                        }
                         item = {
                             ...item,
-                            ...parsed.item,
+                            ...parsedItem,
                             collectionId: item.collectionId,
                             link: item.link
                         };
+                        if (!item.cover && hasBlockedPatterns) {
+                            suppressServerParse = true;
+                        }
                     }
                 }
 
@@ -3089,18 +5586,32 @@
                 let createdItem = (createRes && createRes.item) || { ...item };
 
                 // Step 4: Post-create metadata enrichment (enrichCreated parity)
-                createdItem = await enrichCreated(url, createdItem);
+                createdItem = await enrichCreated(url, createdItem, {
+                    sentPleaseParse: Boolean(item.pleaseParse),
+                    suppressServerParse
+                });
+                if (createdItem && createdItem._id !== undefined && createdItem._id !== null) {
+                    deletedBookmarkIds.delete(createdItem._id);
+                }
                 cacheSavedBookmark(url, createdItem);
                 logDebug('Bookmark saved', { url, bookmarkId: createdItem._id, collectionId: getBookmarkCollectionId(createdItem) });
+
+                const needsScreenshot = !hasBookmarkThumbnail(createdItem);
 
                 if (myEpoch === uiEpoch) {
                     overlay.showSaved(createdItem, {
                         existing: false,
-                        candidates: buildCandidateImages(createdItem, meta)
+                        candidates: buildCandidateImages(createdItem, meta),
+                        capturingScreenshot: needsScreenshot
                     });
                 }
 
-                return createdItem;
+                if (!needsScreenshot) {
+                    return createdItem;
+                }
+
+                // Step 5: Auto-capture simple viewport page screenshot when no thumbnail was found
+                return await attachAutoScreenshot(createdItem, url, meta, myEpoch);
             } catch (err) {
                 logError('Auto-save failed', { url, error: err });
                 if (myEpoch === uiEpoch) {
@@ -3121,11 +5632,18 @@
     // -------------------------------------------------------------------------
     // Load & SPA Lifecycle Watcher
     // -------------------------------------------------------------------------
+    function isDomReady() {
+        return typeof document !== 'undefined'
+            && (document.readyState === 'interactive' || document.readyState === 'complete');
+    }
+
     function cancelPendingSave() {
         if (pendingSaveTimer !== null) {
             clearTimeout(pendingSaveTimer);
             pendingSaveTimer = null;
         }
+        pendingSaveUrl = null;
+        pendingSaveDueAt = 0;
     }
 
     function scheduleSave(delayMs = getSpaDelayMs(), targetUrl = location.href) {
@@ -3145,8 +5663,15 @@
 
         const waitMs = Math.max(0, Number(delayMs) || 0);
         logDebug('Scheduled save', { url: targetUrl, delayMs: waitMs });
+        if (waitMs === 0) {
+            return saveCurrentUrl(targetUrl);
+        }
+        pendingSaveUrl = targetUrl;
+        pendingSaveDueAt = Date.now() + waitMs;
         pendingSaveTimer = setTimeout(() => {
             pendingSaveTimer = null;
+            pendingSaveUrl = null;
+            pendingSaveDueAt = 0;
             return saveCurrentUrl(targetUrl);
         }, waitMs);
     }
@@ -3162,24 +5687,83 @@
         scheduleSave(getSpaDelayMs(), nextUrl);
     }
 
-    function startOnReady() {
-        const triggerInitial = () => {
-            lastObservedUrl = location.href;
-            scheduleSave(Math.min(INITIAL_LOAD_SETTLE_MS, getSpaDelayMs()), location.href);
-        };
+    function attachDomMutationObserver() {
+        if (domObserverAttached) return;
+        if (typeof MutationObserver !== 'function' || typeof document === 'undefined') return;
+        const target = document.documentElement || document;
+        if (!target) return;
 
-        const waitForLoad = () => {
-            if (document.readyState === 'complete') {
-                triggerInitial();
-            } else {
-                window.addEventListener('load', triggerInitial, { once: true });
+        domObserverAttached = true;
+        const observer = new MutationObserver(() => {
+            if (document.visibilityState === 'hidden') return;
+            if (location.href !== lastObservedUrl) {
+                handleUrlChange();
+            }
+        });
+        observer.observe(target, {
+            childList: true,
+            subtree: true
+        });
+    }
+
+    function cleanupDomReadyListeners() {
+        if (typeof domReadyListenerCleanup === 'function') {
+            domReadyListenerCleanup();
+            domReadyListenerCleanup = null;
+        }
+    }
+
+    function triggerInitialSave() {
+        if (initialSaveTriggered) return;
+        if (typeof document !== 'undefined' && document.prerendering) return;
+        initialSaveTriggered = true;
+        cleanupDomReadyListeners();
+        attachDomMutationObserver();
+        lastObservedUrl = location.href;
+        scheduleSave(Math.min(INITIAL_LOAD_SETTLE_MS, getSpaDelayMs()), location.href);
+    }
+
+    function waitForDomReady() {
+        if (initialSaveTriggered) return;
+        if (typeof document !== 'undefined' && document.prerendering) return;
+        if (isDomReady()) {
+            triggerInitialSave();
+            return;
+        }
+        if (domReadyListenerCleanup) return;
+
+        const onReadyStateChange = () => {
+            if (isDomReady()) {
+                triggerInitialSave();
             }
         };
 
-        if (document.prerendering) {
-            document.addEventListener('prerenderingchange', waitForLoad, { once: true });
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+            document.addEventListener('DOMContentLoaded', triggerInitialSave, { once: true });
+            document.addEventListener('readystatechange', onReadyStateChange);
+        }
+        if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+            window.addEventListener('load', triggerInitialSave, { once: true });
+            window.addEventListener('pageshow', triggerInitialSave, { once: true });
+        }
+
+        domReadyListenerCleanup = () => {
+            if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+                document.removeEventListener('DOMContentLoaded', triggerInitialSave);
+                document.removeEventListener('readystatechange', onReadyStateChange);
+            }
+            if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+                window.removeEventListener('load', triggerInitialSave);
+                window.removeEventListener('pageshow', triggerInitialSave);
+            }
+        };
+    }
+
+    function startOnReady() {
+        if (typeof document !== 'undefined' && document.prerendering) {
+            document.addEventListener('prerenderingchange', waitForDomReady, { once: true });
         } else {
-            waitForLoad();
+            waitForDomReady();
         }
     }
 
@@ -3192,25 +5776,40 @@
         }
 
         document.addEventListener('visibilitychange', () => {
+            overlay.handleVisibilityChange();
             if (document.visibilityState !== 'hidden') {
+                if (!initialSaveTriggered && !document.prerendering && isDomReady()) {
+                    triggerInitialSave();
+                } else if (
+                    pendingSaveTimer !== null
+                    && pendingSaveUrl === location.href
+                    && Date.now() >= pendingSaveDueAt
+                ) {
+                    const targetUrl = pendingSaveUrl;
+                    cancelPendingSave();
+                    saveCurrentUrl(targetUrl);
+                }
                 handleUrlChange();
             }
         });
 
-        if (typeof MutationObserver === 'function' && (document.documentElement || document)) {
-            const observer = new MutationObserver(() => {
-                if (document.visibilityState === 'hidden') return;
-                if (location.href !== lastObservedUrl) {
-                    handleUrlChange();
-                }
-            });
-            observer.observe(document.documentElement || document, {
-                childList: true,
-                subtree: true
-            });
+        window.addEventListener('pageshow', (event) => {
+            if (!initialSaveTriggered && !document.prerendering && isDomReady()) {
+                triggerInitialSave();
+            } else if (event && event.persisted) {
+                handleUrlChange();
+            }
+            overlay.handleVisibilityChange();
+        });
+
+        if (isDomReady()) {
+            attachDomMutationObserver();
         }
 
         setInterval(() => {
+            if (!initialSaveTriggered && !document.prerendering && isDomReady()) {
+                triggerInitialSave();
+            }
             if (document.visibilityState !== 'hidden' && location.href !== lastObservedUrl) {
                 handleUrlChange();
             }
@@ -3303,7 +5902,26 @@
             resolveTargetCollectionId,
             enrichCreated,
             selectThumbnail,
+            blockThumbnailUrl,
+            getBlockedThumbnails,
+            isThumbnailBlocked,
+            safeDecodeUri,
+            extractRdlInnerUrl,
+            sanitizeMediaAndCover,
+            reconcileBookmarkBlockedThumbnails,
+            uploadBookmarkCover,
+            captureAndSaveScreenshot,
+            captureSimpleViewportScreenshot,
+            captureCenterPageScreenshot,
+            captureViaForeignObject,
+            captureViaDirectCanvas,
+            canvasHasVisualContent,
+            getViewportCaptureRect,
+            getCenterCropRect,
+            hasBookmarkThumbnail,
+            waitForPageReadyForCapture,
             toggleFavorite,
+            deleteBookmark,
             addBookmarkTags,
             removeBookmarkTag,
             normalizeTagsList,
@@ -3312,6 +5930,9 @@
             saveCurrentUrl,
             scheduleSave,
             handleUrlChange,
+            startOnReady,
+            initNavigationHooks,
+            isDomReady,
             buildCandidateImages,
             getBookmarkCollectionId,
             buildDefaultSiteExcludePattern,
@@ -3324,7 +5945,8 @@
             logWarn,
             logDebug,
             STORAGE_KEYS,
-            DEFAULT_EXCLUDE_PATTERNS
+            DEFAULT_EXCLUDE_PATTERNS,
+            DEFAULT_BLOCKED_THUMBNAILS
         });
     }
 
